@@ -1,0 +1,131 @@
+# ===============================
+# Model Configuration
+# ===============================
+
+# ---------- TOC Detection ----------
+toc_detection:
+  keyword_based:
+    enabled: true
+    keywords:
+      - "table of contents"
+      - "contents"
+      - "index"
+      - "chapter"
+    min_confidence: 0.6
+
+  vision_llm:
+    enabled: true
+    purpose: "toc_verification"
+    input_type: "image_base64"
+    expected_output: "YES|NO"
+
+    provider: local       # local | api
+    model: "llava-1.5-7b" # local free vision model
+    max_tokens: 10
+    temperature: 0.0
+
+# ---------- OCR ----------
+ocr:
+  enabled: true
+  engine: tesseract
+  language: eng
+  dpi: 300
+  confidence_threshold: 0.5
+
+# ---------- Offset Identification ----------
+offset_detection:
+  enabled: true
+  anchor_matching:
+    min_anchor_length: 5
+    min_occurrences: 2
+    frequency_strategy: "max"
+
+  negative_offset_handling:
+    clamp_to_zero: true
+
+# ---------- Style Identification ----------
+style_detection:
+  enabled: true
+  font_analysis:
+    detect_font_size: true
+    min_occurrence_ratio: 0.05
+
+  roles:
+    chapter: "largest_frequent"
+    subheading: "second_largest"
+    body: "most_frequent"
+
+  running_header_footer:
+    remove: true
+    frequency_threshold: 0.8
+
+# ---------- Chunk Accumulation ----------
+chunking:
+  enabled: true
+  strategy: "hierarchical"
+
+  max_chars: 1500
+  split_on: "sentence"
+
+  accumulation_rules:
+    anchor: "subheading"
+    chapter_scope: true
+    allow_cross_page: true
+
+  ordering:
+    sort_by: "page_physical"
+
+# ---------- Overlap ----------
+overlap:
+  enabled: true
+  pre_overlap: 300
+  post_overlap: 300
+
+# ---------- Embeddings ----------
+embedding:
+  enabled: true
+  provider: sentence-transformers
+  model: all-MiniLM-L6-v2   # fast + free + accurate
+  device: cpu
+  normalize: true
+
+# ---------- Retriever ----------
+retriever:
+  default: hybrid
+
+  semantic:
+    top_k: 10
+
+  graph:
+    enabled: true
+    traversal_depth: 2
+
+  reranker:
+    enabled: false          # can enable later
+    model: cross-encoder/ms-marco-MiniLM-L-6-v2
+
+# ---------- Answering ----------
+answering:
+  llm:
+    provider: local
+    model: mistral-7b-instruct
+    temperature: 0.2
+    max_tokens: 512
+
+  citation:
+    enabled: true
+    format: "Author, Book, Page {page_label}"
+
+  safety:
+    refuse_if_no_context: true
+
+# ---------- Performance ----------
+performance:
+  batch_size: 8
+  enable_caching: true
+  cache_ttl: 3600
+
+# ---------- Logging ----------
+logging:
+  level: INFO
+  log_model_calls: false

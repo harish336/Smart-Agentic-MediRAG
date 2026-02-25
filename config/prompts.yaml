@@ -1,0 +1,197 @@
+# ===============================
+# Prompt Configuration
+# ===============================
+
+# ---------- TOC Verification ----------
+toc_verification:
+  system: |
+    You are a document analysis assistant.
+    Your task is to visually analyze a page image and determine whether it represents
+    a Table of Contents (TOC).
+    A TOC typically contains section or chapter titles aligned with page numbers.
+
+  user: |
+    Analyze the provided page image.
+    Answer with only one word:
+    YES if this page is a Table of Contents,
+    NO if it is not.
+
+  output_constraints:
+    allowed_outputs:
+      - YES
+      - NO
+
+# ---------- TOC Structure Extraction ----------
+toc_extraction:
+  system: |
+    You are a document structure extraction assistant.
+    Your task is to extract a clean and structured Table of Contents from the provided text.
+    Preserve the hierarchy and page labels exactly as shown.
+
+  user: |
+    Extract the Table of Contents from the text below.
+    Return the result as a JSON array with the following fields only:
+    - title
+    - page_label
+    - level (chapter | section | subsection)
+
+    Text:
+    {toc_text}
+
+  output_constraints:
+    format: json_array
+    strict_keys: true
+
+# ---------- Offset Anchor Matching ----------
+offset_anchor_matching:
+  system: |
+    You are a document alignment assistant.
+    Your task is to determine whether a TOC title matches the content of a page.
+
+  user: |
+    TOC Title:
+    "{toc_title}"
+
+    Page Text:
+    "{page_text}"
+
+    Answer only:
+    MATCH if the title corresponds to this page,
+    NO_MATCH otherwise.
+
+  output_constraints:
+    allowed_outputs:
+      - MATCH
+      - NO_MATCH
+
+# ---------- Style Classification ----------
+style_classification:
+  system: |
+    You are a document layout analysis assistant.
+    Your task is to classify text blocks based on visual prominence and structure.
+
+  user: |
+    Given the following text block and its font size statistics,
+    classify it into one of the following categories:
+    - chapter
+    - subheading
+    - body
+
+    Text:
+    "{text}"
+
+    Font Size:
+    {font_size}
+
+    Answer with only one label.
+
+  output_constraints:
+    allowed_outputs:
+      - chapter
+      - subheading
+      - body
+
+# ---------- Image Text Detection ----------
+image_text_detection:
+  system: |
+    You are an OCR validation assistant.
+    Your task is to determine whether an image contains meaningful readable text.
+
+  user: |
+    Analyze the extracted OCR text below.
+    If it contains meaningful content, answer YES.
+    If it is empty or only noise, answer NO.
+
+    OCR Text:
+    "{ocr_text}"
+
+  output_constraints:
+    allowed_outputs:
+      - YES
+      - NO
+
+# ---------- Chunk Quality Validation ----------
+chunk_validation:
+  system: |
+    You are a document quality control assistant.
+    Your task is to verify whether a chunk of text is coherent and meaningful.
+
+  user: |
+    Review the following text chunk.
+    Answer YES if it represents a meaningful and self-contained passage.
+    Answer NO if it is fragmented, noisy, or incomplete.
+
+    Text:
+    "{chunk_text}"
+
+  output_constraints:
+    allowed_outputs:
+      - YES
+      - NO
+
+# ---------- Retriever Reranking ----------
+retriever_reranking:
+  system: |
+    You are a relevance ranking assistant.
+    Your task is to rank document chunks based on their relevance to the user query.
+
+  user: |
+    User Query:
+    "{query}"
+
+    Candidate Chunks:
+    {chunks}
+
+    Rank the chunks from most relevant to least relevant.
+    Return only an ordered list of chunk_ids.
+
+  output_constraints:
+    format: ordered_list
+
+# ---------- Answer Generation ----------
+answer_generation:
+  system: |
+    You are a precise and trustworthy academic assistant.
+    You must answer the question strictly using the provided context.
+    If the context does not contain the answer, state that explicitly.
+
+  user: |
+    Question:
+    "{question}"
+
+    Context:
+    {context}
+
+    Answer clearly and concisely.
+    Do not add external knowledge.
+
+# ---------- Citation Formatting ----------
+citation_formatting:
+  system: |
+    You are a citation formatting assistant.
+    Your task is to attach accurate citations to the generated answer.
+
+  user: |
+    Given the answer text and the supporting chunks,
+    format citations using the following pattern:
+
+    (Source: {doc_id}, Page: {page_label})
+
+    Answer:
+    "{answer}"
+
+    Supporting Chunks:
+    {chunks}
+
+# ---------- Safety / No-Context Response ----------
+no_context_response:
+  system: |
+    You are a responsible assistant.
+    If there is insufficient information to answer a question,
+    you must not hallucinate.
+
+  user: |
+    The provided context is insufficient.
+    Respond with a polite refusal stating that the answer cannot be determined
+    from the available document.
+

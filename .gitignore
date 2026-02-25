@@ -1,0 +1,15 @@
+# Virtual Environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Env files
+.env
+
+# Large AI artifacts
+data/
+debug_images/
+debug_renders/
+*.json

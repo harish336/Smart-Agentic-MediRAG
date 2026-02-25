@@ -1,0 +1,125 @@
+# ===============================
+# Database Configuration
+# ===============================
+
+# ---------- Vector Database ----------
+vector_db:
+  enabled: true
+  type: chroma          # chroma | faiss | milvus (free-first)
+  persist: true
+  persist_path: "./data/vector_store"
+
+  embedding:
+    provider: sentence-transformers
+    model: all-MiniLM-L6-v2   # fast, free, high accuracy
+    device: cpu               # cpu | cuda
+    normalize: true
+
+  collection:
+    name: smart_chunks
+    distance_metric: cosine   # cosine | l2 | ip
+
+  indexing:
+    batch_size: 64
+    parallelism: 2
+
+  metadata_fields:
+    - chunk_id
+    - doc_id
+    - chapter
+    - subheading
+    - page_label
+    - page_physical
+
+# ---------- Graph Database ----------
+graph_db:
+  enabled: true
+  type: neo4j
+
+  connection:
+    uri: "bolt://localhost:7687"
+    username: "neo4j"
+    password: "password"
+    database: "neo4j"
+
+  nodes:
+    document:
+      label: Document
+      primary_key: doc_id
+
+    chapter:
+      label: Chapter
+      primary_key: name
+
+    subheading:
+      label: Subheading
+      primary_key: name
+
+    chunk:
+      label: Chunk
+      primary_key: chunk_id
+
+  relationships:
+    document_chapter:
+      from: Document
+      to: Chapter
+      type: HAS_CHAPTER
+
+    chapter_subheading:
+      from: Chapter
+      to: Subheading
+      type: HAS_SUBHEADING
+
+    subheading_chunk:
+      from: Subheading
+      to: Chunk
+      type: HAS_CHUNK
+
+    chunk_sequence_next:
+      from: Chunk
+      to: Chunk
+      type: NEXT
+
+    chunk_sequence_prev:
+      from: Chunk
+      to: Chunk
+      type: PREV
+
+# ---------- Metadata / Registry ----------
+metadata_store:
+  enabled: true
+  type: sqlite
+  path: "./data/metadata.db"
+
+  tables:
+    documents:
+      - doc_id
+      - title
+      - source_path
+      - total_pages
+      - created_at
+
+    ingestion_logs:
+      - doc_id
+      - status
+      - error_message
+      - timestamp
+
+# ---------- Image Storage ----------
+image_storage:
+  enabled: true
+  mode: url_only        # url_only | remote
+  base_url: "/media/images"
+  store_locally: false  # MUST remain false as per requirement
+
+# ---------- Safety & Failover ----------
+failover:
+  allow_vector_only: true
+  allow_graph_only: true
+  skip_storage_on_error: false
+
+# ---------- Performance ----------
+performance:
+  enable_caching: true
+  cache_size: 1024
+  async_writes: true

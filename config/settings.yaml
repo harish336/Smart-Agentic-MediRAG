@@ -1,0 +1,145 @@
+# ===============================
+# Global System Settings
+# ===============================
+
+project:
+  name: "SmartChunk-RAG"
+  environment: "development"     # development | production
+  fail_soft: true                # system must not crash on partial failures
+
+# ---------- PDF Processing ----------
+pdf:
+  max_pages: null                # null = no limit
+  render_dpi: 200
+  extract_images: true
+  preserve_layout: true
+
+# ---------- TOC Detection ----------
+toc:
+  enabled: true
+  max_scan_pages: 15              # scan only initial pages
+  allow_llm_verification: true
+
+  keyword_detection:
+    enabled: true
+    min_keyword_matches: 2
+    confidence_threshold: 0.6
+
+  fallback_behavior:
+    skip_if_not_found: true       # jump directly to style chunking
+
+# ---------- TOC Extraction ----------
+toc_extraction:
+  prefer_structured_pdf: true
+  allow_ocr_fallback: true
+  max_toc_pages: 5
+  normalize_whitespace: true
+
+# ---------- Offset Identification ----------
+offset:
+  enabled: true
+  anchor_matching:
+    min_anchor_length: 5
+    min_anchor_matches: 2
+    max_pages_to_search: 50
+
+  frequency_strategy: "max"       # max | median
+  clamp_negative_offset: true
+
+  page_label_handling:
+    preserve_roman: true
+    preserve_decimal: true
+    preserve_custom: true         # e.g., 1.1.1
+
+# ---------- Style Identification ----------
+style:
+  enabled: true
+
+  font_size_analysis:
+    min_frequency_ratio: 0.05
+    ignore_extreme_sizes: true
+
+  role_mapping:
+    chapter: "largest_frequent"
+    subheading: "second_largest"
+    body: "most_frequent"
+
+  running_headers:
+    remove: true
+    frequency_threshold: 0.8
+
+# ---------- Smart Chunking ----------
+chunking:
+  enabled: true
+  strategy: "hierarchical"
+
+  accumulation:
+    anchor_level: "subheading"    # chapter | subheading
+    allow_cross_page: true
+    reset_on_new_chapter: true
+
+  size:
+    max_chars: 1500
+    min_chars: 200
+    split_strategy: "sentence"
+
+  sorting:
+    order_by: "page_physical"
+
+# ---------- Overlap ----------
+overlap:
+  enabled: true
+  pre_overlap: 300
+  post_overlap: 300
+
+# ---------- Image Handling ----------
+images:
+  attempt_ocr: true
+  min_ocr_text_length: 20
+
+  storage:
+    store_locally: false
+    use_url_reference: true
+
+# ---------- Metadata ----------
+metadata:
+  store_page_label: true
+  store_physical_page: true
+  store_chapter: true
+  store_subheading: true
+  store_html: true
+
+# ---------- Validation ----------
+validation:
+  chunk_quality_check: true
+  discard_invalid_chunks: false
+
+# ---------- Retriever Defaults ----------
+retrieval:
+  default_top_k: 10
+  allow_hybrid: true
+  graph_expansion_depth: 2
+
+# ---------- Answering ----------
+answering:
+  require_citations: true
+  refuse_without_context: true
+  max_context_chunks: 8
+
+# ---------- Logging ----------
+logging:
+  level: INFO
+  log_pipeline_steps: true
+  log_failures: true
+
+# ---------- Performance ----------
+performance:
+  parallel_pdf_pages: 4
+  batch_processing: true
+  batch_size: 16
+
+# ---------- Debug / Dev ----------
+debug:
+  save_intermediate_outputs: false
+  dump_toc_text: false
+  dump_chunks: false
