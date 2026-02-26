@@ -39,7 +39,7 @@ graph_db:
   connection:
     uri: "bolt://localhost:7687"
     username: "neo4j"
-    password: "password"
+    password: "Harish_2004"
     database: "neo4j"
 
   nodes:

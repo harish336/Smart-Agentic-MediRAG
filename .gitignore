@@ -13,3 +13,7 @@ data/
 debug_images/
 debug_renders/
 *.json
+
+# config files
+config/db.yaml
+config/models.yaml

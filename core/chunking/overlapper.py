@@ -32,9 +32,34 @@ POST_OVERLAP = 300
 
 
 class ChunkOverlapper:
-    def __init__(self, chunks: List[Dict]):
-        self.chunks = chunks
-        self.overlapped_chunks = []
+
+    def __init__(self):
+        print("[OVERLAP] Initialized")
+
+    def apply(self, chunks: list) -> list:
+
+        if not chunks:
+            return []
+
+        overlapped = []
+
+        for i, chunk in enumerate(chunks):
+
+            new_chunk = chunk.copy()
+
+            # Pre overlap
+            if i > 0:
+                prev_text = chunks[i - 1]["text"]
+                new_chunk["text"] = prev_text[-300:] + " " + new_chunk["text"]
+
+            # Post overlap
+            if i < len(chunks) - 1:
+                next_text = chunks[i + 1]["text"]
+                new_chunk["text"] += " " + next_text[:300]
+
+            overlapped.append(new_chunk)
+
+        return overlapped
 
     # -------------------------------------------------
     # STEP 1: Apply overlap

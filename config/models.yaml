@@ -129,3 +129,10 @@ performance:
 logging:
   level: INFO
   log_model_calls: false
+
+# ---------- Emotion Analysis ----------
+emotion:
+  provider: local
+  model: phi
+  temperature: 0.0
+  max_tokens: 50
