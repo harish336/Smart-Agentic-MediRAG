@@ -9,7 +9,6 @@ __pycache__/
 .env
 
 # Large AI artifacts
-data/
 debug_images/
 debug_renders/
 *.json
