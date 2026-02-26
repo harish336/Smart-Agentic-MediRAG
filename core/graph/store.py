@@ -1,13 +1,17 @@
 """
-Smart Medirag — Optimized Graph Store (Neo4j)
+Smart Medirag — Production Graph Store (Neo4j)
 
-Production-grade:
-- Safe MERGE usage
-- Auto constraint creation
+Features:
+- Safe MERGE-based ingestion
+- Unique constraints auto-created
 - Fully idempotent
-- Batch ingestion (high performance)
-- Batch sequence linking
-- Fail-soft support
+- High-performance batch ingestion (UNWIND)
+- Batch NEXT linking
+- Public run_query() for retrievers
+- Clean metadata storage
+- Stores doc_id inside Chunk (CRITICAL FIX)
+
+Author: Smart Medirag System
 """
 
 from neo4j import GraphDatabase
@@ -62,7 +66,7 @@ class GraphStore:
         print("[GRAPH STORE] Connected successfully\n")
 
     # =====================================================
-    # CONSTRAINT CREATION
+    # CREATE CONSTRAINTS
     # =====================================================
 
     def _create_constraints(self):
@@ -76,14 +80,17 @@ class GraphStore:
         print("[GRAPH STORE] Constraints verified\n")
 
     # =====================================================
-    # BATCH INGESTION (HIGH PERFORMANCE)
+    # BATCH INGESTION (FULLY CORRECTED)
     # =====================================================
 
     def batch_ingest(self, doc_id: str, chunks: list):
         """
         High-performance ingestion using UNWIND.
         Fully idempotent.
-        Null-safe for MERGE.
+        Ensures:
+            - doc_id stored inside Chunk
+            - Proper chapter/subheading linking
+            - Emotion node linking
         """
 
         query = f"""
@@ -93,16 +100,17 @@ class GraphStore:
         UNWIND $chunks AS chunk
 
         WITH d,
-            chunk,
-            COALESCE(chunk.chapter, "Unknown") AS chapter_name,
-            COALESCE(chunk.subheading, "Unknown") AS subheading_name,
-            COALESCE(chunk.emotion, "Neutral") AS emotion_name
+             chunk,
+             COALESCE(chunk.chapter, "Unknown") AS chapter_name,
+             COALESCE(chunk.subheading, "Unknown") AS subheading_name,
+             COALESCE(chunk.emotion, "Neutral") AS emotion_name
 
         MERGE (c:{CHAPTER} {{{DOC_ID}: $doc_id, {NAME}: chapter_name}})
         MERGE (s:{SUBHEADING} {{{DOC_ID}: $doc_id, {NAME}: subheading_name}})
         MERGE (ch:{CHUNK} {{{CHUNK_ID}: chunk.chunk_id}})
 
-        SET ch.{TEXT} = chunk.text,
+        SET ch.{DOC_ID} = $doc_id,
+            ch.{TEXT} = chunk.text,
             ch.{PAGE_LABEL} = chunk.page_label,
             ch.{PAGE_PHYSICAL} = chunk.page_physical
 
@@ -120,17 +128,19 @@ class GraphStore:
                     "doc_id": doc_id,
                     "chunks": chunks
                 })
+
         except Exception as e:
-            print(f"[GRAPH BATCH INGEST ERROR] {e}")
+            print("[GRAPH STORE] Batch ingestion failed:", e)
             raise
 
     # =====================================================
-    # BATCH SEQUENCE LINKING
+    # BATCH SEQUENTIAL LINKING
     # =====================================================
 
     def batch_link(self, links: list):
         """
-        Batch NEXT relationship creation.
+        Creates NEXT relationships between chunks.
+        links = [(chunk_id_1, chunk_id_2), ...]
         """
 
         query = f"""
@@ -143,15 +153,16 @@ class GraphStore:
         try:
             with self.driver.session(database=self.database) as session:
                 session.run(query, {"links": links})
+
         except Exception as e:
-            print(f"[GRAPH BATCH LINK ERROR] {e}")
+            print("[GRAPH STORE] Batch link failed:", e)
             raise
 
     # =====================================================
     # DOCUMENT EXISTS CHECK
     # =====================================================
 
-    def document_exists(self, doc_id):
+    def document_exists(self, doc_id: str) -> bool:
 
         query = f"""
         MATCH (d:{DOCUMENT} {{{DOC_ID}: $doc_id}})
@@ -161,6 +172,45 @@ class GraphStore:
         with self.driver.session(database=self.database) as session:
             result = session.run(query, {"doc_id": doc_id})
             return result.single() is not None
+
+    # =====================================================
+    # PUBLIC READ QUERY METHOD
+    # =====================================================
+
+    def run_query(self, cypher: str, params: dict = None):
+        """
+        Standard read query executor.
+        Used by GraphRetriever.
+        """
+
+        if params is None:
+            params = {}
+
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run(cypher, params)
+                return [record.data() for record in result]
+
+        except Exception as e:
+            print("[GRAPH STORE] Query failed:", e)
+            return []
+
+    # =====================================================
+    # DELETE DOCUMENT (OPTIONAL UTILITY)
+    # =====================================================
+
+    def delete_document(self, doc_id: str):
+        """
+        Deletes document and its related structure.
+        """
+
+        query = f"""
+        MATCH (d:{DOCUMENT} {{{DOC_ID}: $doc_id}})
+        DETACH DELETE d
+        """
+
+        with self.driver.session(database=self.database) as session:
+            session.run(query, {"doc_id": doc_id})
 
     # =====================================================
     # CLOSE CONNECTION
