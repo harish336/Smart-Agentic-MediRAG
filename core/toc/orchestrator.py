@@ -22,7 +22,7 @@ from core.toc.detector import TOCDetector
 from core.toc.extractor_rule_based import RuleBasedTOCExtractor
 from core.toc.extractor_llm_fallback import LLMTOCExtractor
 from core.toc.confidence import TOCConfidenceScorer
-
+from core.toc.offset_finder import OffsetFinder
 
 SAVE_INTERMEDIATE = True
 
@@ -116,6 +116,25 @@ class TOCOrchestrator:
                 json.dump(self.toc_entries, f, indent=2)
 
             print("[ORCH] LLM TOC saved → toc_llm_fallback.json")
+    
+    # -------------------------------------------------
+    # STEP 5: OFFSET DETECTION (NEW)
+    # -------------------------------------------------
+    def detect_offset(self):
+
+        print("\n[ORCH] STEP 5 — Detecting page offset...")
+
+        if not self.toc_entries:
+            print("[ORCH] ❌ Cannot compute offset — TOC empty")
+            return
+
+        finder = OffsetFinder(self.pdf_path, self.toc_entries)
+        self.offset = finder.run()
+
+        if self.offset is None:
+            print("[ORCH] ❌ Offset detection failed")
+        else:
+            print(f"[ORCH] ✅ Page Offset Detected: {self.offset}")
 
     # -------------------------------------------------
     # SMART DECISION LOGIC
@@ -161,6 +180,9 @@ class TOCOrchestrator:
 
         # Step 4: Smart decision
         self.decide_extraction_strategy(confidence_level)
+
+        # Step 5: Offset detection
+        self.detect_offset()
 
         # Final Output
         print("\n" + "=" * 100)

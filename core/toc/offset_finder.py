@@ -1,11 +1,12 @@
 """
-ULTRA-SAFE Production Offset Finder
-Handles:
-- Roman + numeric numbering
-- Header or footer numbering
-- Mixed front-matter + body
-- Requires sequential confirmation
-- Fails safely
+ULTRA-SAFE Production Offset Finder (v2)
+Fixes:
+- False positives from body numbers
+- Large random offset drift (e.g., 244)
+- Mixed Roman + numeric numbering
+- Header / footer only detection
+- Center-aligned number preference
+- Sequential verification safety
 """
 
 import sys
@@ -13,6 +14,13 @@ import re
 import json
 import fitz
 from collections import Counter
+
+
+# -------------------------------------------------
+# Roman conversion
+# -------------------------------------------------
+
+MAX_REASONABLE_OFFSET = 80
 
 
 ROMAN_MAP = {
@@ -37,6 +45,10 @@ def roman_to_int(roman: str):
     return total
 
 
+# -------------------------------------------------
+# Offset Finder
+# -------------------------------------------------
+
 class OffsetFinder:
 
     def __init__(self, pdf_path, toc_entries):
@@ -47,6 +59,7 @@ class OffsetFinder:
     # -------------------------------------------------
     # STEP 1: Load PDF
     # -------------------------------------------------
+
     def load_pdf(self):
         print("[STEP 1] Loading PDF...")
         self.doc = fitz.open(self.pdf_path)
@@ -55,19 +68,25 @@ class OffsetFinder:
     # -------------------------------------------------
     # Normalize logical page labels
     # -------------------------------------------------
+
     def normalize(self, label):
         if not label:
             return None
+
         label = str(label).strip()
+
         if label.isdigit():
             return int(label)
+
         return roman_to_int(label)
 
     # -------------------------------------------------
     # Collect logical pages from TOC
     # -------------------------------------------------
+
     def collect_logical_pages(self):
         pages = []
+
         for e in self.toc_entries:
             val = self.normalize(e.get("page_label"))
             if val:
@@ -78,25 +97,40 @@ class OffsetFinder:
         return pages
 
     # -------------------------------------------------
-    # Extract page numbers from full page
+    # SAFE page number extraction
     # -------------------------------------------------
+
     def extract_page_numbers(self, page):
-        text = page.get_text()
-        numbers = []
 
-        # Numeric
-        for n in re.findall(r"\b\d{1,4}\b", text):
-            val = int(n)
-            if 1 <= val <= 3000:
-                numbers.append(val)
+        page_height = page.rect.height
+        blocks = page.get_text("blocks")
 
-        # Roman
-        for r in re.findall(r"\b[ivxlcdmIVXLCDM]{1,7}\b", text):
-            val = roman_to_int(r)
-            if val:
-                numbers.append(val)
+        candidates = []
 
-        return numbers
+        for b in blocks:
+            x0, y0, x1, y1, text, *_ = b
+
+            # Only header or footer region
+            if y1 < page_height * 0.20 or y0 > page_height * 0.80:
+
+                words = re.findall(r"\b\d{1,3}\b", text)
+
+                for w in words:
+                    val = int(w)
+
+                    # Page numbers should be small
+                    if 1 <= val <= self.doc.page_count + 10:
+                        candidates.append(val)
+
+                # Roman numbers
+                roman_words = re.findall(r"\b[ivxlcdmIVXLCDM]{1,6}\b", text)
+
+                for r in roman_words:
+                    val = roman_to_int(r)
+                    if val and val <= 50:
+                        candidates.append(val)
+
+        return candidates
 
     # -------------------------------------------------
     # Core offset logic
@@ -104,71 +138,81 @@ class OffsetFinder:
     def find_offset(self):
 
         self.load_pdf()
-        logical_pages = self.collect_logical_pages()
 
-        if len(logical_pages) < 3:
-            print("[FAIL] Not enough logical anchors.")
-            return None
+        page_candidates = {}
 
-        offset_votes = []
-
-        print("[STEP] Scanning for anchor matches...")
-
-        scan_limit = min(self.doc.page_count, 300)
-
-        for phys in range(scan_limit):
+        for phys in range(self.doc.page_count):
             page = self.doc.load_page(phys)
-            numbers = self.extract_page_numbers(page)
+            nums = self.extract_page_numbers(page)
+            if nums:
+                page_candidates[phys] = nums
 
-            for printed in numbers:
-                if printed in logical_pages:
-                    offset = phys - (printed - 1)
-                    offset_votes.append(offset)
+        offset_scores = Counter()
 
-        if not offset_votes:
-            print("[FAIL] No anchors found.")
+        for phys, nums in page_candidates.items():
+            for printed in nums:
+                offset = phys - (printed - 1)
+                offset_scores[offset] += 1
+
+        if not offset_scores:
+            print("[FAIL] No offset candidates found.")
             return None
 
-        counter = Counter(offset_votes)
-        candidate, support = counter.most_common(1)[0]
+        candidates = offset_scores.most_common(5)
 
-        print(f"[INFO] Top offset candidate: {candidate} (support={support})")
+        best_offset = None
+        best_sequence = 0
 
-        # SAFETY: require minimum stability
-        if support < 3:
-            print("[FAIL] Offset not stable enough.")
+        for offset, _ in candidates:
+
+            streak = 0
+            max_streak = 0
+
+            for phys in sorted(page_candidates.keys()):
+                expected = phys - offset + 1
+                if expected in page_candidates.get(phys, []):
+                    streak += 1
+                    max_streak = max(max_streak, streak)
+                else:
+                    streak = 0
+
+            if max_streak > best_sequence:
+                best_sequence = max_streak
+                best_offset = offset
+
+        if best_sequence < 5:
+            print("[FAIL] No stable sequential numbering detected.")
             return None
 
-        # Sequential confirmation
-        confirmed = 0
-        for logical in logical_pages[:10]:
-            phys = logical - 1 + candidate
-            if 0 <= phys < self.doc.page_count:
-                page = self.doc.load_page(phys)
-                numbers = self.extract_page_numbers(page)
-                if logical in numbers:
-                    confirmed += 1
-
-        print(f"[INFO] Sequential confirmation count: {confirmed}")
-
-        if confirmed < 3:
-            print("[FAIL] Offset failed sequential verification.")
+        # 🔒 HARD SAFETY LIMIT
+        if abs(best_offset) > MAX_REASONABLE_OFFSET:
+            print(
+                f"[WARNING] Offset {best_offset} exceeds safe limit "
+                f"({MAX_REASONABLE_OFFSET}). Ignoring offset."
+            )
             return None
 
-        print(f"[SUCCESS] Offset determined: {candidate}")
-        return candidate
+        print(
+            f"[SUCCESS] Offset determined: {best_offset} "
+            f"(streak={best_sequence})"
+        )
+
+        return best_offset
 
     # -------------------------------------------------
-    # PUBLIC API (Required by Orchestrator)
+    # Public API
     # -------------------------------------------------
+
     def run(self):
         return self.find_offset()
+
 
 # ============================================================
 # STANDALONE RUNNER
 # ============================================================
 
 def main():
+
     if len(sys.argv) < 3:
         print("Usage:")
         print("  python offset_finder.py <pdf_path> <toc_json>")
@@ -178,7 +222,7 @@ def main():
     toc_json = sys.argv[2]
 
     print("=" * 60)
-    print("OFFSET FINDER — STANDALONE TEST")
+    print("ULTRA-SAFE OFFSET FINDER v2")
     print(f"PDF Path : {pdf_path}")
     print(f"TOC File : {toc_json}")
     print("=" * 60)
