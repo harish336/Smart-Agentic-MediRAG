@@ -19,10 +19,13 @@ Author: SmartChunk-RAG System
 
 import hashlib
 from typing import List, Dict
+import os
+from PyPDF2 import PdfReader
 
 from core.vector.embedder import VectorEmbedder
 from core.vector.store import ChromaStore
 from core.vector.validator import VectorChunkValidator
+from core.registry.document_registry import DocumentRegistry
 
 from config.system_loader import (
     get_database_config,
@@ -54,6 +57,19 @@ class VectorOrchestrator:
 
         # Deterministic document ID
         self.document_id = self.generate_document_id(pdf_path)
+
+        self.registry = DocumentRegistry()
+
+        reader = PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+        title = os.path.basename(pdf_path)
+
+        self.registry.register(
+            doc_id=self.document_id,
+            title=title,
+            source_path=pdf_path,
+            total_pages=total_pages
+        )
 
         print(f"[VECTOR] Document ID: {self.document_id}")
         print("=" * 80)
