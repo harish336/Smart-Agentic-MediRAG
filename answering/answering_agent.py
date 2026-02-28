@@ -18,6 +18,7 @@ It does NOT:
 Memory logic must live in MemoryWrappedAnsweringAgent.
 """
 
+import os
 import requests
 from typing import Dict, Optional
 
@@ -40,8 +41,8 @@ logger = get_component_logger("AnsweringAgent", component="answering")
 # LLM CONFIG
 # ============================================================
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "mistral:7b-instruct"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b-instruct")
 
 
 # ============================================================
@@ -235,8 +236,11 @@ class AnsweringAgent:
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.2,
-                "top_p": 0.9,
+                "temperature": 0.0,
+                "top_p": 0.15,
+                "top_k": 20,
+                "repeat_penalty": 1.1,
+                "seed": 42,
                 "num_predict": 600
             }
         }
@@ -265,7 +269,7 @@ class AnsweringAgent:
     def _needs_follow_up(self, response_text: str) -> bool:
         if not response_text:
             return True
-        return response_text.strip().lower() == "information not found"
+        return response_text.strip().lower() == "dont have an answer"
 
     def _build_follow_up(self, query: str, intent: str) -> str:
         if intent == "medical":

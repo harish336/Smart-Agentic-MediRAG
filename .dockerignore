@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+data/vector_store
+debug_images
+debug_renders
+logs
+frontend-app/node_modules
+frontend-app/dist

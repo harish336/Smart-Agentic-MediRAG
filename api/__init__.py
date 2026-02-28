@@ -12,6 +12,9 @@ Usage:
 from flask import Flask, jsonify
 from flask_cors import CORS
 import logging
+import os
+
+from database.app_store import init_db
 
 
 # ============================================================
@@ -23,9 +26,15 @@ def create_app():
     app = Flask(__name__)
 
     # --------------------------------------------------------
-    # Enable CORS (Allow Postman / Frontend calls)
+    # Enable CORS
     # --------------------------------------------------------
-    CORS(app)
+    cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
+    cors_origins = (
+        [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]
+        if cors_origins_raw != "*"
+        else "*"
+    )
+    CORS(app, resources={r"/*": {"origins": cors_origins}})
 
     # --------------------------------------------------------
     # Basic Logging Configuration
@@ -36,10 +45,18 @@ def create_app():
     )
 
     # --------------------------------------------------------
+    # Initialize DB
+    # --------------------------------------------------------
+    init_db()
+
+    # --------------------------------------------------------
     # Register Routes
     # --------------------------------------------------------
     from api.routes import register_routes
     register_routes(app)
+
+    from api.auth import auth_blueprint
+    app.register_blueprint(auth_blueprint, url_prefix="/auth")
 
     # --------------------------------------------------------
     # Global Error Handler (JSON-safe)

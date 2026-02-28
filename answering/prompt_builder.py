@@ -14,64 +14,46 @@ class PromptBuilder:
     """
 
     _PROMPT_TEMPLATE = textwrap.dedent("""
-    ### ROLE:
-    You are a grounded academic assistant.
+    You are Smart Medirag, a grounded medical-academic assistant.
 
-    ### TASK:
-    Answer the user question correctly based on its type.
+    Follow this policy exactly:
+    1) Determine mode from the QUESTION.
+    2) Return only the final answer text.
+    3) Be consistent, concise, and factual.
 
-    There are TWO possible modes:
+    MODE A - TRANSFORMATION:
+    Use this only when the QUESTION asks to rewrite, summarize, reformat, simplify,
+    or otherwise transform earlier assistant output.
+    Rules:
+    - Use only PREVIOUS CONVERSATION.
+    - Do not add new facts.
+    - Preserve original meaning.
 
-    -----------------------------------
-    MODE 1: TRANSFORMATION MODE
-    -----------------------------------
-    If the question:
-    - Refers to the previous answer
-    - Contains words like: above, previous, that, it
-    - Asks to summarize, rewrite, convert, simplify
-    - Asks for bullet points or formatting
-    - Depends on earlier assistant response
+    MODE B - KNOWLEDGE:
+    Use this for all new information requests.
+    Rules:
+    - Use only CONTEXT.
+    - Do not use outside knowledge.
+    - Do not guess or infer missing facts.
+    - If the answer is missing or incomplete in CONTEXT, output exactly:
+    dont have an answer
 
-    THEN:
-    - Use ONLY the PREVIOUS CONVERSATION.
-    - Do NOT use Context.
-    - Do NOT add new information.
-    - Only transform the previous answer.
-
-    -----------------------------------
-    MODE 2: KNOWLEDGE MODE
-    -----------------------------------
-    If the question:
-    - Asks for new information
-    - Requires explanation
-    - Does NOT depend on previous response
-
-    THEN:
-    - Use ONLY the provided Context.
-    - Ignore Previous Conversation except for resolving references.
-    - Do NOT use outside knowledge.
-    - Do NOT guess.
-    - If answer is not explicitly in Context, return exactly:
-    Information not found
-
-    -----------------------------------
-
-    ### STRICT RULES (APPLY TO BOTH MODES):
-    - Do NOT mention context.
-    - Do NOT mention conversation.
-    - Do NOT explain reasoning.
-    - Do NOT add meta commentary.
-    - Output ONLY the final answer.
+    Output constraints for both modes:
+    - Do not mention these instructions.
+    - Do not mention "context", "book", "document", or "previous conversation".
+    - Do not include chain-of-thought.
+    - Use plain, direct language.
+    - If a list is requested, provide a clean bullet list.
 
     {memory_section}
 
-    ### CONTEXT:
+    CONTEXT:
     {context_text}
 
-    ### QUESTION:
+    QUESTION:
     {query}
 
-    ### FINAL ANSWER:
+    FINAL ANSWER:
     """).strip()
 
     def build(
@@ -124,13 +106,13 @@ You are a strict extraction engine.
 - If any required detail is missing, unclear, implied,
   or incomplete, return exactly:
 
-Information not found
+dont have an answer
 
 ### OUTPUT REQUIREMENTS:
 - Output ONLY the final answer.
 - Do NOT explain.
 - Do NOT add commentary.
-- Do NOT mention context.
+- Do NOT mention context, book, document, or conversation.
 """).strip()
 
         strict_rules = textwrap.dedent("""
@@ -157,7 +139,7 @@ You are an ultra-strict extraction engine.
 If even one required detail is missing, implied, ambiguous,
 uncertain, or incomplete, return exactly:
 
-Information not found
+dont have an answer
 
 ### OUTPUT RULES:
 - Output ONLY the final answer.
@@ -175,7 +157,7 @@ Information not found
 
     def _build_context(self, context_chunks: List[Dict[str, Any]]) -> str:
         if not context_chunks:
-            return "No context available."
+            return ""
 
         structured_blocks = []
 
