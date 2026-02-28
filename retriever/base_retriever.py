@@ -1,35 +1,30 @@
 """
-SmartChunk-RAG — Base Retriever
-
-Responsibilities:
-- Define unified retriever interface
-- Enforce standardized output schema
-- Provide optional LRU caching
-- Provide fail-soft safety wrapper
-- Support performance config
-- Enable future async support
-
-Author: SmartChunk-RAG System
+SmartChunk-RAG — Base Retriever (Corrected Core Version)
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Tuple
-from functools import lru_cache
+from typing import List, Dict, Optional
 import hashlib
 
 from config.system_loader import get_system_config
+from core.utils.logging_utils import get_component_logger
+
+
+# =====================================================
+# LOGGER SETUP
+# =====================================================
+
+logger = get_component_logger("BaseRetriever", component="retrieval")
 
 
 class BaseRetriever(ABC):
     """
-    Abstract base retriever class.
-
-    All retrievers (Vector, Graph, Hybrid) must inherit from this.
-
+    Abstract base retriever.
     Enforces:
-        - Standard output format
-        - Caching support
-        - Fail-soft compatibility
+        - Validation
+        - Sorting
+        - Deduplication
+        - Top-k trimming
     """
 
     # =====================================================
@@ -38,60 +33,77 @@ class BaseRetriever(ABC):
 
     def __init__(self):
 
-        system_config = get_system_config()
+        try:
+            system_config = get_system_config()
 
-        self.fail_soft = system_config["project"].get("fail_soft", True)
+            self.fail_soft = system_config["project"].get("fail_soft", True)
 
-        performance_cfg = system_config.get("performance", {})
+            performance_cfg = system_config.get("performance", {})
+            self.enable_cache = performance_cfg.get("enable_caching", False)
+            self.cache_size = performance_cfg.get("cache_size", 512)
 
-        self.enable_cache = performance_cfg.get("enable_caching", False)
-        self.cache_size = performance_cfg.get("cache_size", 512)
+            logger.info(
+                f"{self.__class__.__name__} initialized "
+                f"(fail_soft={self.fail_soft}, caching={self.enable_cache})"
+            )
+
+        except Exception:
+            logger.exception("Failed to initialize BaseRetriever")
+            raise
 
     # =====================================================
-    # PUBLIC RETRIEVE ENTRY
+    # PUBLIC RETRIEVE ENTRY (UNIFIED PIPELINE)
     # =====================================================
 
     def retrieve(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 15,
         filters: Optional[Dict] = None
     ) -> List[Dict]:
-        """
-        Public safe wrapper for retrieval.
-
-        Applies:
-            - Input validation
-            - Optional caching
-            - Fail-soft handling
-        """
 
         if not query:
             return []
 
         try:
-            if self.enable_cache:
-                return self._cached_retrieve(
-                    self._cache_key(query, top_k, filters)
-                )
 
-            return self._retrieve_internal(query, top_k, filters)
+            # Raw retrieval
+            results = self._retrieve_internal(query, top_k, filters)
+
+            if not results:
+                return []
+
+            # Validate schema
+            results = self._validate_output(results)
+
+            if not results:
+                return []
+
+            # Deduplicate
+            results = self.deduplicate(results)
+
+            # Sort by score (safety)
+            results.sort(
+                key=lambda x: x["score"],
+                reverse=True
+            )
+
+            # Trim to top_k
+            return results[:top_k]
 
         except Exception as e:
 
-            print(f"[{self.__class__.__name__}] Retrieval error:", e)
+            logger.exception(
+                f"{self.__class__.__name__} retrieval error"
+            )
 
             if not self.fail_soft:
                 raise e
 
-            print(
-                f"[{self.__class__.__name__}] "
-                "Fail-soft enabled — returning empty list"
-            )
             return []
 
     # =====================================================
-    # INTERNAL RETRIEVE (Must be implemented)
+    # INTERNAL RETRIEVE (Child must implement)
     # =====================================================
 
     @abstractmethod
@@ -101,28 +113,13 @@ class BaseRetriever(ABC):
         top_k: int,
         filters: Optional[Dict]
     ) -> List[Dict]:
-        """
-        Core retrieval logic implemented by child classes.
-        Must return standardized output format.
-        """
         pass
 
     # =====================================================
-    # STANDARD OUTPUT VALIDATION
+    # OUTPUT VALIDATION
     # =====================================================
 
     def _validate_output(self, results: List[Dict]) -> List[Dict]:
-        """
-        Ensures output matches required schema.
-
-        Required keys:
-            - chunk_id
-            - doc_id
-            - score
-            - source
-            - text
-            - metadata
-        """
 
         validated = []
 
@@ -140,10 +137,9 @@ class BaseRetriever(ABC):
                 "metadata"
             }
 
-            if not required_keys.issubset(set(r.keys())):
+            if not required_keys.issubset(r.keys()):
                 continue
 
-            # Ensure numeric score
             try:
                 r["score"] = float(r["score"])
             except Exception:
@@ -151,16 +147,29 @@ class BaseRetriever(ABC):
 
             validated.append(r)
 
-        # Sort by score descending
-        validated.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
         return validated
 
     # =====================================================
-    # CACHING SYSTEM
+    # HYBRID-SAFE DEDUPLICATION
+    # =====================================================
+
+    def deduplicate(self, results: List[Dict]) -> List[Dict]:
+
+        best = {}
+
+        for r in results:
+            unique_key = (r["doc_id"], r["chunk_id"])
+
+            if unique_key not in best:
+                best[unique_key] = r
+            else:
+                if r["score"] > best[unique_key]["score"]:
+                    best[unique_key] = r
+
+        return list(best.values())
+
+    # =====================================================
+    # CACHE KEY (Optional future use)
     # =====================================================
 
     def _cache_key(
@@ -169,61 +178,19 @@ class BaseRetriever(ABC):
         top_k: int,
         filters: Optional[Dict]
     ) -> str:
-        """
-        Generate deterministic cache key.
-        """
 
         key_string = f"{query}|{top_k}|{filters}"
         return hashlib.sha256(key_string.encode()).hexdigest()
 
-    @lru_cache(maxsize=1024)
-    def _cached_retrieve(self, cache_key: str) -> Tuple[Dict]:
-        """
-        Cached wrapper around internal retrieval.
-        """
-
-        # Decode cache key not needed — only used as identifier
-        # We recompute actual retrieval without decoding.
-        # Caching is based on key uniqueness.
-
-        # Extract parameters by calling internal retrieve again
-        # We cannot reverse the key — so we re-call with stored parameters
-        # Instead, override in child if needed for advanced caching
-
-        raise NotImplementedError(
-            "Child retriever must override caching logic "
-            "if enable_cache=True"
-        )
-
     # =====================================================
-    # PERFORMANCE OPTIMIZATION HELPERS
-    # =====================================================
-
-    def deduplicate(self, results: List[Dict]) -> List[Dict]:
-        """
-        Remove duplicate chunk_ids.
-        Keeps highest score.
-        """
-
-        seen = {}
-        for r in results:
-            cid = r["chunk_id"]
-            if cid not in seen or r["score"] > seen[cid]["score"]:
-                seen[cid] = r
-
-        return list(seen.values())
-
-    # =====================================================
-    # OPTIONAL ASYNC SUPPORT (Future Extension)
+    # OPTIONAL ASYNC SUPPORT
     # =====================================================
 
     async def retrieve_async(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 15,
         filters: Optional[Dict] = None
     ) -> List[Dict]:
-        """
-        Async-ready interface for future scalability.
-        """
+
         return self.retrieve(query, top_k, filters)

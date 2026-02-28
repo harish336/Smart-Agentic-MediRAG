@@ -1,20 +1,22 @@
 """
 TOC Confidence Scorer
-
-Purpose:
-- Score how reliable a TOC extraction is
-- Decide whether LLM fallback is required
-- Fully explainable and deterministic
-
-This file CAN be run standalone.
 """
 
 import sys
 import json
-from pprint import pprint
+from pprint import pformat
+
+from core.utils.logging_utils import get_component_logger
+
+# =====================================================
+# LOGGER SETUP
+# =====================================================
+
+logger = get_component_logger("TOCConfidenceScorer", component="ingestion")
 
 
 class TOCConfidenceScorer:
+
     def __init__(self, toc_entries: list):
         self.toc_entries = toc_entries
         self.score = 0
@@ -24,6 +26,7 @@ class TOCConfidenceScorer:
     # STEP 1: Count metrics
     # -------------------------------------------------
     def compute_metrics(self):
+
         chapters = 0
         sections = 0
         subsections = 0
@@ -59,16 +62,6 @@ class TOCConfidenceScorer:
     # STEP 2: Score calculation
     # -------------------------------------------------
     def calculate_score(self):
-        """
-        Scoring logic (tuned for textbook PDFs):
-
-        - Each entry: +1
-        - Chapter: +3
-        - Section: +2
-        - Subsection: +2
-        - Page label present: +2
-        - Unknown level: -1
-        """
 
         score = 0
 
@@ -94,12 +87,6 @@ class TOCConfidenceScorer:
     # STEP 3: Decision
     # -------------------------------------------------
     def decision(self):
-        """
-        Thresholds:
-        - >= 40 : HIGH confidence (rule-based OK)
-        - 20–39 : MEDIUM confidence (optional LLM)
-        - < 20  : LOW confidence (LLM fallback required)
-        """
 
         if self.score >= 40:
             return "HIGH"
@@ -111,61 +98,70 @@ class TOCConfidenceScorer:
     # RUN
     # -------------------------------------------------
     def run(self):
-        print("[STEP 1] Computing TOC metrics...")
-        self.compute_metrics()
-        pprint(self.breakdown)
 
-        print("\n[STEP 2] Calculating confidence score...")
-        self.calculate_score()
-        print(f"[INFO] Confidence Score: {self.score}")
+        try:
+            logger.info("[STEP 1] Computing TOC metrics...")
+            self.compute_metrics()
+            logger.info(pformat(self.breakdown))
 
-        print("\n[STEP 3] Final decision...")
-        decision = self.decision()
-        print(f"[RESULT] Confidence Level: {decision}")
+            logger.info("[STEP 2] Calculating confidence score...")
+            self.calculate_score()
+            logger.info(f"Confidence Score: {self.score}")
 
-        return {
-            "score": self.score,
-            "level": decision,
-            "metrics": self.breakdown
-        }
+            logger.info("[STEP 3] Final decision...")
+            decision = self.decision()
+            logger.info(f"Confidence Level: {decision}")
+
+            return {
+                "score": self.score,
+                "level": decision,
+                "metrics": self.breakdown
+            }
+
+        except Exception:
+            logger.exception("TOC confidence scoring failed")
+            raise
 
 
 # ============================================================
 # STANDALONE RUNNER
 # ============================================================
+
 def main():
+
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python confidence.py <toc_json_file>")
-        print("\nExample:")
-        print("  python confidence.py toc_output.json")
+        logger.warning("Usage: python confidence.py <toc_json_file>")
         sys.exit(1)
 
     toc_file = sys.argv[1]
 
-    print("=" * 90)
-    print("TOC CONFIDENCE SCORER STARTED")
-    print(f"Input TOC file: {toc_file}")
-    print("=" * 90)
+    logger.info("=" * 90)
+    logger.info("TOC CONFIDENCE SCORER STARTED")
+    logger.info(f"Input TOC file: {toc_file}")
+    logger.info("=" * 90)
 
     try:
-        with open(toc_file, "r", encoding="utf-8") as f:
-            toc_entries = json.load(f)
-    except UnicodeDecodeError:
-        print("[WARN] UTF-8 decode failed, trying UTF-16...")
-        with open(toc_file, "r", encoding="utf-16") as f:
-            toc_entries = json.load(f)
+        try:
+            with open(toc_file, "r", encoding="utf-8") as f:
+                toc_entries = json.load(f)
+        except UnicodeDecodeError:
+            logger.warning("UTF-8 decode failed, trying UTF-16...")
+            with open(toc_file, "r", encoding="utf-16") as f:
+                toc_entries = json.load(f)
 
+        scorer = TOCConfidenceScorer(toc_entries)
+        result = scorer.run()
 
-    scorer = TOCConfidenceScorer(toc_entries)
-    result = scorer.run()
+        logger.info("[FINAL CONFIDENCE RESULT]")
+        logger.info(pformat(result))
 
-    print("\n[FINAL CONFIDENCE RESULT]")
-    pprint(result)
+        logger.info("=" * 90)
+        logger.info("TOC CONFIDENCE SCORER COMPLETED")
+        logger.info("=" * 90)
 
-    print("=" * 90)
-    print("TOC CONFIDENCE SCORER COMPLETED")
-    print("=" * 90)
+    except Exception:
+        logger.exception("Standalone confidence scorer crashed")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

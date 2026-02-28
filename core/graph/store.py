@@ -18,6 +18,8 @@ from neo4j import GraphDatabase
 from config.system_loader import get_database_config
 from core.graph.schema import (
     CREATE_CONSTRAINTS,
+    CREATE_INDEXES,
+    CHUNK_TEXT_FULLTEXT_INDEX,
     DOCUMENT,
     CHAPTER,
     SUBHEADING,
@@ -62,6 +64,7 @@ class GraphStore:
         )
 
         self._create_constraints()
+        self._create_indexes()
 
         print("[GRAPH STORE] Connected successfully\n")
 
@@ -78,6 +81,20 @@ class GraphStore:
                 session.run(query)
 
         print("[GRAPH STORE] Constraints verified\n")
+
+    # =====================================================
+    # CREATE INDEXES
+    # =====================================================
+
+    def _create_indexes(self):
+
+        print("[GRAPH STORE] Creating indexes (if not exists)...")
+
+        with self.driver.session(database=self.database) as session:
+            for query in CREATE_INDEXES:
+                session.run(query)
+
+        print("[GRAPH STORE] Indexes verified\n")
 
     # =====================================================
     # BATCH INGESTION (FULLY CORRECTED)
@@ -194,6 +211,49 @@ class GraphStore:
         except Exception as e:
             print("[GRAPH STORE] Query failed:", e)
             return []
+
+    # =====================================================
+    # FULLTEXT SEARCH (OPTIONAL FAST PATH)
+    # =====================================================
+
+    def fulltext_query_chunks(
+        self,
+        query: str,
+        limit: int,
+        doc_id: str = None,
+        emotion: str = None
+    ):
+        """
+        Fast retrieval using fulltext index.
+        Falls back to caller if index is unavailable.
+        """
+
+        cypher = f"""
+        CALL db.index.fulltext.queryNodes("{CHUNK_TEXT_FULLTEXT_INDEX}", $query)
+        YIELD node, score
+        OPTIONAL MATCH (node)-[:HAS_EMOTION]->(e:Emotion)
+        WHERE
+            ($doc_id IS NULL OR node.doc_id = $doc_id)
+            AND ($emotion IS NULL OR e.name = $emotion)
+        RETURN
+            node.chunk_id AS chunk_id,
+            node.doc_id AS doc_id,
+            node.text AS text,
+            e.name AS emotion,
+            score AS score
+        ORDER BY score DESC
+        LIMIT $limit
+        """
+
+        return self.run_query(
+            cypher,
+            {
+                "query": query,
+                "limit": limit,
+                "doc_id": doc_id,
+                "emotion": emotion
+            }
+        )
 
     # =====================================================
     # DELETE DOCUMENT (OPTIONAL UTILITY)

@@ -1,5 +1,5 @@
 """
-Smart Medirag — Graph Ingestion Validator
+Smart Medirag â€” Graph Ingestion Validator
 
 Purpose:
 - Validate chunk before graph insertion
@@ -32,30 +32,57 @@ class GraphValidator:
 
     def __init__(self, graph_store):
         self.store = graph_store
-        self.errors = []
-        self.warnings = []
 
     # =====================================================
     # MAIN VALIDATION ENTRY
     # =====================================================
 
-    def validate_chunk(self, chunk: dict):
+    def validate_chunk(self, chunk: dict, doc_exists: bool = None, log: bool = True):
 
-        self.errors = []
-        self.warnings = []
+        errors = []
+        warnings = []
 
-        self._validate_required_fields(chunk)
-        self._validate_types(chunk)
-        self._validate_emotion(chunk)
-        self._check_duplicate_chunk(chunk)
+        self._validate_required_fields(chunk, errors, warnings)
+        self._validate_types(chunk, errors)
+        self._validate_emotion(chunk, warnings)
+        self._check_duplicate_chunk(chunk, warnings, doc_exists)
 
-        return self._finalize()
+        return self._finalize(errors, warnings, log)
+
+    def validate_chunks(self, chunks: list, doc_exists: bool = None, log: bool = True):
+
+        if not chunks:
+            return []
+
+        if doc_exists is None:
+            doc_exists = self.store.document_exists(chunks[0].get(DOC_ID))
+
+        valid_chunks = []
+        all_errors = []
+        all_warnings = []
+
+        for chunk in chunks:
+            result = self.validate_chunk(chunk, doc_exists=doc_exists, log=False)
+            if result["valid"]:
+                valid_chunks.append(chunk)
+            all_errors.extend(result["errors"])
+            all_warnings.extend(result["warnings"])
+
+        if log:
+            self._finalize_summary(
+                total=len(chunks),
+                valid=len(valid_chunks),
+                errors=all_errors,
+                warnings=all_warnings
+            )
+
+        return valid_chunks
 
     # =====================================================
     # REQUIRED FIELDS
     # =====================================================
 
-    def _validate_required_fields(self, chunk):
+    def _validate_required_fields(self, chunk, errors, warnings):
 
         required = [
             DOC_ID,
@@ -65,62 +92,64 @@ class GraphValidator:
 
         for field in required:
             if field not in chunk or not chunk[field]:
-                self.errors.append(f"Missing required field: {field}")
+                errors.append(f"Missing required field: {field}")
 
         # Soft-required fields
         if not chunk.get("chapter"):
-            self.warnings.append("Missing chapter — will default to 'Unknown'")
+            warnings.append("Missing chapter â€” will default to 'Unknown'")
 
         if not chunk.get("subheading"):
-            self.warnings.append("Missing subheading — will default to 'Unknown'")
+            warnings.append("Missing subheading â€” will default to 'Unknown'")
 
     # =====================================================
     # TYPE VALIDATION
     # =====================================================
 
-    def _validate_types(self, chunk):
+    def _validate_types(self, chunk, errors):
 
         if not isinstance(chunk.get(DOC_ID), str):
-            self.errors.append("doc_id must be string")
+            errors.append("doc_id must be string")
 
         if not isinstance(chunk.get(CHUNK_ID), str):
-            self.errors.append("chunk_id must be string")
+            errors.append("chunk_id must be string")
 
         if not isinstance(chunk.get(TEXT), str):
-            self.errors.append("text must be string")
+            errors.append("text must be string")
 
         if chunk.get(PAGE_PHYSICAL) is not None and not isinstance(chunk.get(PAGE_PHYSICAL), int):
-            self.errors.append("page_physical must be integer")
+            errors.append("page_physical must be integer")
 
     # =====================================================
     # EMOTION VALIDATION
     # =====================================================
 
-    def _validate_emotion(self, chunk):
+    def _validate_emotion(self, chunk, warnings):
 
         emotion = chunk.get("emotion")
 
         if not emotion:
-            self.warnings.append("Emotion missing — defaulting to Neutral")
+            warnings.append("Emotion missing â€” defaulting to Neutral")
             return
 
         if emotion not in self.ALLOWED_EMOTIONS:
-            self.warnings.append(
-                f"Emotion '{emotion}' not recognized — setting to Neutral"
+            warnings.append(
+                f"Emotion '{emotion}' not recognized â€” setting to Neutral"
             )
 
     # =====================================================
     # DUPLICATE CHECK
     # =====================================================
 
-    def _check_duplicate_chunk(self, chunk):
+    def _check_duplicate_chunk(self, chunk, warnings, doc_exists: bool = None):
 
         chunk_id = chunk.get(CHUNK_ID)
 
         if not chunk_id:
             return
 
-        exists = self.store.document_exists(chunk.get(DOC_ID))
+        exists = doc_exists
+        if exists is None:
+            exists = self.store.document_exists(chunk.get(DOC_ID))
 
         # Soft logic:
         # If document exists, we allow re-ingestion
@@ -128,8 +157,8 @@ class GraphValidator:
         # But we warn if document already exists.
 
         if exists:
-            self.warnings.append(
-                f"Document {chunk.get(DOC_ID)} already exists — "
+            warnings.append(
+                f"Document {chunk.get(DOC_ID)} already exists â€” "
                 f"MERGE will prevent duplication"
             )
 
@@ -139,40 +168,74 @@ class GraphValidator:
 
     def validate_sequence(self, previous_chunk_id, current_chunk_id):
 
-        if previous_chunk_id == current_chunk_id:
-            self.errors.append("Chunk cannot link to itself")
+        errors = []
+        warnings = []
 
-        return self._finalize()
+        if previous_chunk_id == current_chunk_id:
+            errors.append("Chunk cannot link to itself")
+
+        return self._finalize(errors, warnings, log=True)
 
     # =====================================================
     # FINALIZE RESULT
     # =====================================================
 
-    def _finalize(self):
+    def _finalize(self, errors, warnings, log: bool = True):
+
+        if log:
+            print("\n" + "=" * 70)
+            print("[GRAPH VALIDATOR] Validation Summary")
+            print("=" * 70)
+
+            if errors:
+                print("\n[ERRORS]")
+                for e in errors:
+                    print(" -", e)
+
+            if warnings:
+                print("\n[WARNINGS]")
+                for w in warnings:
+                    print(" -", w)
+
+            if not errors:
+                print("\n[STATUS] VALID")
+            else:
+                print("\n[STATUS] INVALID")
+
+            print("=" * 70 + "\n")
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings
+        }
+
+    def _finalize_summary(self, total: int, valid: int, errors: list, warnings: list):
 
         print("\n" + "=" * 70)
-        print("[GRAPH VALIDATOR] Validation Summary")
+        print("[GRAPH VALIDATOR] Batch Validation Summary")
         print("=" * 70)
+        print(f"Total chunks : {total}")
+        print(f"Valid chunks : {valid}")
+        print(f"Invalid      : {total - valid}")
 
-        if self.errors:
-            print("\n[ERRORS]")
-            for e in self.errors:
+        if errors:
+            print("\n[ERRORS] (sample)")
+            for e in errors[:5]:
                 print(" -", e)
+            if len(errors) > 5:
+                print(f" ... ({len(errors)} total)")
 
-        if self.warnings:
-            print("\n[WARNINGS]")
-            for w in self.warnings:
+        if warnings:
+            print("\n[WARNINGS] (sample)")
+            for w in warnings[:5]:
                 print(" -", w)
+            if len(warnings) > 5:
+                print(f" ... ({len(warnings)} total)")
 
-        if not self.errors:
+        if not errors:
             print("\n[STATUS] VALID")
         else:
             print("\n[STATUS] INVALID")
 
         print("=" * 70 + "\n")
-
-        return {
-            "valid": len(self.errors) == 0,
-            "errors": self.errors,
-            "warnings": self.warnings
-        }

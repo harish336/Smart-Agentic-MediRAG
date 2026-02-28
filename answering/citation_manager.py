@@ -1,12 +1,12 @@
 """
-SmartChunk-RAG — Citation Manager (Enhanced)
+SmartChunk-RAG — Citation Manager (Production Version)
 
 Features:
+- Semantic deduplication (doc_id + page + chapter + subheading)
+- Supports vector + graph merged results
+- Limits to MAX_CITATIONS
 - Removes null fields
-- Keeps only valid fields
-- Detects hex doc_id
 - Maps doc_id → document_name
-- Avoids duplicate citations
 - Windows-safe path handling
 """
 
@@ -17,7 +17,6 @@ import re
 
 class CitationManager:
 
-    # Your PDF folder path
     DATA_FOLDER = r"C:\Users\Harish\Downloads\Smart Medirag\data"
 
     ALLOWED_FIELDS = [
@@ -32,6 +31,8 @@ class CitationManager:
         "source"
     ]
 
+    MAX_CITATIONS = 15
+
     # ============================================================
     # PUBLIC METHOD
     # ============================================================
@@ -39,16 +40,21 @@ class CitationManager:
     def build(self, retrieved_chunks):
 
         citations = []
+        seen_keys = set()
 
         for r in retrieved_chunks:
+
+            if len(citations) >= self.MAX_CITATIONS:
+                break
 
             metadata = r.get("metadata", {})
 
             citation = {}
 
-            # -------------------------
-            # Collect all possible fields
-            # -------------------------
+            # ----------------------------------------------------
+            # Collect fields from retriever result
+            # ----------------------------------------------------
+
             combined = {
                 "doc_id": r.get("doc_id"),
                 "chunk_id": r.get("chunk_id"),
@@ -60,16 +66,37 @@ class CitationManager:
                 "page_physical": metadata.get("page_physical"),
             }
 
-            # -------------------------
-            # Clean null values
-            # -------------------------
+            # ----------------------------------------------------
+            # Remove null / empty fields
+            # ----------------------------------------------------
+
             for key, value in combined.items():
                 if key in self.ALLOWED_FIELDS and value not in [None, "", "None"]:
                     citation[key] = value
 
-            # -------------------------
+            if not citation:
+                continue
+
+            # ----------------------------------------------------
+            # 🔥 Semantic Deduplication Key
+            # ----------------------------------------------------
+
+            unique_key = (
+                citation.get("doc_id"),
+                citation.get("page_physical"),
+                self._normalize(citation.get("chapter")),
+                self._normalize(citation.get("subheading"))
+            )
+
+            if unique_key in seen_keys:
+                continue
+
+            seen_keys.add(unique_key)
+
+            # ----------------------------------------------------
             # Map doc_id → document_name
-            # -------------------------
+            # ----------------------------------------------------
+
             doc_id = citation.get("doc_id")
 
             if doc_id and self._is_hex(doc_id):
@@ -77,13 +104,18 @@ class CitationManager:
                 if document_name:
                     citation["document_name"] = document_name
 
-            # -------------------------
-            # Avoid duplicates
-            # -------------------------
-            if citation and citation not in citations:
-                citations.append(citation)
+            citations.append(citation)
 
         return citations
+
+    # ============================================================
+    # NORMALIZATION (for stable dedup)
+    # ============================================================
+
+    def _normalize(self, value):
+        if not value:
+            return None
+        return str(value).strip().lower()
 
     # ============================================================
     # HEX CHECK
@@ -108,7 +140,6 @@ class CitationManager:
                     continue
 
                 file_path = os.path.join(self.DATA_FOLDER, filename)
-
                 file_hash = self._compute_hash(file_path)
 
                 if file_hash.startswith(doc_id):

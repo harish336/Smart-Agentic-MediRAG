@@ -18,6 +18,10 @@ import fitz  # PyMuPDF
 from pprint import pprint
 from typing import List, Dict
 
+from core.utils.logging_utils import get_component_logger
+
+logger = get_component_logger("ImageHandler", component="ingestion")
+
 
 class ImageHandler:
     def __init__(self, pdf_path: str, temp_dir: str = ".tmp_images"):
@@ -27,107 +31,129 @@ class ImageHandler:
         self.images = []
 
     # -------------------------------------------------
-    # STEP 1: Load PDF
+    # Internal Lazy Loader (Load Only Once)
+    # -------------------------------------------------
+    def _ensure_loaded(self):
+        if self.doc is None:
+            logger.info("Lazy loading PDF...")
+            try:
+                self.doc = fitz.open(self.pdf_path)
+                logger.info(f"PDF loaded successfully. Total pages: {self.doc.page_count}")
+            except Exception as e:
+                logger.exception(f"Failed during lazy loading: {e}")
+                raise
+
+    # -------------------------------------------------
+    # STEP 1: Load PDF (Explicit)
     # -------------------------------------------------
     def load_pdf(self):
-        print("[STEP 1] Loading PDF...")
-        self.doc = fitz.open(self.pdf_path)
-        print("[OK] PDF loaded")
-        print(f"[INFO] Total pages: {self.doc.page_count}")
+        logger.info("STEP 1: Loading PDF...")
+        try:
+            if self.doc is not None:
+                logger.info("PDF already loaded. Skipping reload.")
+                return
+
+            self.doc = fitz.open(self.pdf_path)
+            logger.info(f"PDF loaded successfully. Total pages: {self.doc.page_count}")
+
+        except Exception as e:
+            logger.exception(f"Failed to load PDF: {e}")
+            sys.exit(1)
 
     # -------------------------------------------------
     # STEP 2: Scan pages for images
     # -------------------------------------------------
     def scan_images(self):
-        print("\n[STEP 2] Scanning pages for images...")
+        logger.info("STEP 2: Scanning pages for images...")
 
-        os.makedirs(self.temp_dir, exist_ok=True)
+        try:
+            self._ensure_loaded()
+            os.makedirs(self.temp_dir, exist_ok=True)
 
-        for page_idx in range(self.doc.page_count):
-            page = self.doc.load_page(page_idx)
-            image_list = page.get_images(full=True)
+            for page_idx in range(self.doc.page_count):
+                page = self.doc.load_page(page_idx)
+                image_list = page.get_images(full=True)
 
-            if not image_list:
-                continue
+                if not image_list:
+                    continue
 
-            print(f"[PAGE {page_idx + 1}] Images found: {len(image_list)}")
+                logger.info(f"PAGE {page_idx + 1}: Images found: {len(image_list)}")
 
-            for img_idx, img in enumerate(image_list):
-                self.process_image(page, page_idx, img_idx, img)
+                for img_idx, img in enumerate(image_list):
+                    self.process_image(page, page_idx, img_idx, img)
 
-        print(f"\n[INFO] Total images processed: {len(self.images)}")
+            logger.info(f"Total images processed: {len(self.images)}")
+
+        except Exception as e:
+            logger.exception(f"Image scanning failed: {e}")
 
     # -------------------------------------------------
     # STEP 3: Process single image
     # -------------------------------------------------
     def process_image(self, page, page_idx, img_idx, img):
-        xref = img[0]
-        base_image = self.doc.extract_image(xref)
-        image_bytes = base_image["image"]
-        image_ext = base_image["ext"]
+        try:
+            xref = img[0]
+            base_image = self.doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
 
-        image_id = str(uuid.uuid4())
-        temp_path = os.path.join(self.temp_dir, f"{image_id}.{image_ext}")
+            image_id = str(uuid.uuid4())
+            temp_path = os.path.join(self.temp_dir, f"{image_id}.{image_ext}")
 
-        with open(temp_path, "wb") as f:
-            f.write(image_bytes)
+            with open(temp_path, "wb") as f:
+                f.write(image_bytes)
 
-        print(f"  [IMAGE] Page {page_idx + 1} | Image {img_idx + 1} | Saved temp")
+            logger.info(f"IMAGE | Page {page_idx + 1} | Image {img_idx + 1} | Saved temp")
 
-        # Attempt text extraction from image area
-        extracted_text = self.try_extract_text(page)
+            extracted_text = self.try_extract_text(page)
 
-        image_record = {
-            "id": image_id,
-            "page": page_idx + 1,
-            "type": "image",
-            "format": image_ext,
-            "text": extracted_text,
-            "has_text": bool(extracted_text),
-            "url": self.generate_reference_url(image_id, image_ext)
-        }
+            image_record = {
+                "id": image_id,
+                "page": page_idx + 1,
+                "type": "image",
+                "format": image_ext,
+                "text": extracted_text,
+                "has_text": bool(extracted_text),
+                "url": self.generate_reference_url(image_id, image_ext)
+            }
 
-        self.images.append(image_record)
+            self.images.append(image_record)
 
-        print(f"    → Text detected: {'YES' if extracted_text else 'NO'}")
+            logger.info(f"→ Text detected: {'YES' if extracted_text else 'NO'}")
 
-        # Cleanup temp file
-        os.remove(temp_path)
+            os.remove(temp_path)
+
+        except Exception as e:
+            logger.exception(f"Failed processing image on page {page_idx + 1}: {e}")
 
     # -------------------------------------------------
     # STEP 4: Try extracting text near image
     # -------------------------------------------------
     def try_extract_text(self, page) -> str:
-        """
-        NOTE:
-        This is NOT OCR.
-        It extracts selectable text around images (captions, embedded text).
-        OCR can be plugged here later.
-        """
-        text = page.get_text("text").strip()
-        return text if len(text) < 300 else ""
+        try:
+            text = page.get_text("text").strip()
+            return text if len(text) < 300 else ""
+        except Exception as e:
+            logger.exception(f"Text extraction around image failed: {e}")
+            return ""
 
     # -------------------------------------------------
     # STEP 5: Generate reference URL
     # -------------------------------------------------
     def generate_reference_url(self, image_id, ext):
-        """
-        URL-style reference.
-        In production, this maps to:
-        - S3
-        - MinIO
-        - CDN
-        - Signed endpoint
-        """
         return f"image://{image_id}.{ext}"
 
     # -------------------------------------------------
     # RUN
     # -------------------------------------------------
     def run(self):
-        self.load_pdf()
-        self.scan_images()
-        return self.images
+        try:
+            self.load_pdf()
+            self.scan_images()
+            return self.images
+        except Exception as e:
+            logger.exception(f"ImageHandler run failed: {e}")
+            return []
 
 
 # ============================================================
@@ -135,31 +161,33 @@ class ImageHandler:
 # ============================================================
 def main():
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python image_handler.py <pdf_path>")
+        logger.error("Usage: python image_handler.py <pdf_path>")
         sys.exit(1)
 
     pdf_path = sys.argv[1]
 
-    print("=" * 100)
-    print("IMAGE HANDLER STARTED")
-    print(f"PDF Path: {pdf_path}")
-    print("=" * 100)
+    logger.info("=" * 100)
+    logger.info("IMAGE HANDLER STARTED")
+    logger.info(f"PDF Path: {pdf_path}")
+    logger.info("=" * 100)
 
     handler = ImageHandler(pdf_path)
     images = handler.run()
 
-    print("\n[FINAL IMAGE METADATA]")
+    logger.info("FINAL IMAGE METADATA")
     pprint(images, width=130)
 
     import json
-    with open("images_output.json", "w", encoding="utf-8") as f:
-        json.dump(images, f, indent=2)
+    try:
+        with open("images_output.json", "w", encoding="utf-8") as f:
+            json.dump(images, f, indent=2)
+        logger.info("Output saved to images_output.json")
+    except Exception as e:
+        logger.exception(f"Failed saving output JSON: {e}")
 
-    print("\n[OUTPUT] Saved to images_output.json")
-    print("=" * 100)
-    print("IMAGE HANDLER COMPLETED")
-    print("=" * 100)
+    logger.info("=" * 100)
+    logger.info("IMAGE HANDLER COMPLETED")
+    logger.info("=" * 100)
 
 
 if __name__ == "__main__":

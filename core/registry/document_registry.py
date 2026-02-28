@@ -1,52 +1,66 @@
 """
 SmartChunk-RAG — Document Registry
-
-Stores:
-- doc_id
-- title
-- source_path
-- total_pages
-- created_at
-
-This is the permanent mapping layer.
 """
 
 import sqlite3
 import os
 from datetime import datetime
 from config.system_loader import get_database_config
+from core.utils.logging_utils import get_component_logger
+
+
+# =====================================================
+# LOGGER SETUP
+# =====================================================
+
+logger = get_component_logger("DocumentRegistry", component="ingestion")
 
 
 class DocumentRegistry:
 
     def __init__(self):
 
-        db_config = get_database_config()
-        metadata_cfg = db_config.get("metadata_store", {})
+        try:
+            db_config = get_database_config()
+            metadata_cfg = db_config.get("metadata_store", {})
 
-        self.db_path = os.path.abspath(metadata_cfg.get("path"))
+            self.db_path = os.path.abspath(metadata_cfg.get("path"))
 
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-        self._create_table()
+            self._create_table()
+
+            logger.info(f"Registry initialized at: {self.db_path}")
+
+        except Exception:
+            logger.exception("Failed to initialize DocumentRegistry")
+            raise
+
+    # =====================================================
+    # CREATE TABLE
+    # =====================================================
 
     def _create_table(self):
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                doc_id TEXT PRIMARY KEY,
-                title TEXT,
-                source_path TEXT,
-                total_pages INTEGER,
-                created_at TEXT
-            )
-        """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS documents (
+                        doc_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        source_path TEXT,
+                        total_pages INTEGER,
+                        created_at TEXT
+                    )
+                """)
 
-        conn.commit()
-        conn.close()
+                conn.commit()
+
+        except Exception:
+            logger.exception("Failed creating documents table")
+            raise
 
     # =====================================================
     # REGISTER DOCUMENT
@@ -54,23 +68,29 @@ class DocumentRegistry:
 
     def register(self, doc_id, title, source_path, total_pages):
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
 
-        cursor.execute("""
-            INSERT OR REPLACE INTO documents
-            (doc_id, title, source_path, total_pages, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            doc_id,
-            title,
-            source_path,
-            total_pages,
-            datetime.utcnow().isoformat()
-        ))
+                cursor.execute("""
+                    INSERT OR REPLACE INTO documents
+                    (doc_id, title, source_path, total_pages, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    doc_id,
+                    title,
+                    source_path,
+                    total_pages,
+                    datetime.utcnow().isoformat()
+                ))
 
-        conn.commit()
-        conn.close()
+                conn.commit()
+
+            logger.info(f"Registered document: {doc_id}")
+
+        except Exception:
+            logger.exception(f"Failed registering document: {doc_id}")
+            raise
 
     # =====================================================
     # FETCH ALL
@@ -78,11 +98,15 @@ class DocumentRegistry:
 
     def fetch_all(self):
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM documents")
+                rows = cursor.fetchall()
 
-        cursor.execute("SELECT * FROM documents")
-        rows = cursor.fetchall()
+            logger.info(f"Fetched {len(rows)} documents")
+            return rows
 
-        conn.close()
-        return rows
+        except Exception:
+            logger.exception("Failed fetching documents")
+            raise

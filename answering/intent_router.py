@@ -1,13 +1,36 @@
-import logging
 import requests
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
+from core.utils.logging_utils import get_component_logger
 
-# Setup standard logging for production
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+# ============================================================
+# Logger Setup
+# ============================================================
+
+logger = get_component_logger("IntentRouter", component="answering")
+
+
+# ============================================================
+# Lazy Singleton for Embedding Model (LOAD ONLY ONCE)
+# ============================================================
+
+_embedder_instance: Optional[SentenceTransformer] = None
+
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder_instance
+    if _embedder_instance is None:
+        try:
+            logger.info("Loading SentenceTransformer model (all-MiniLM-L6-v2)...")
+            _embedder_instance = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("Embedding model loaded successfully.")
+        except Exception:
+            logger.exception("Failed to load SentenceTransformer model")
+            raise
+    return _embedder_instance
+
 
 class IntentRouter:
     """
@@ -26,8 +49,12 @@ class IntentRouter:
         self.llm_model = llm_model
         self.similarity_threshold = similarity_threshold
 
-        logger.info("[INTENT ROUTER] Initializing embedding model (all-MiniLM-L6-v2)...")
-        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        try:
+            # Lazy loaded embedder (ONLY FIRST TIME GLOBALLY)
+            self.embedder = get_embedder()
+        except Exception:
+            logger.exception("IntentRouter initialization failed during embedder load")
+            raise
 
         # Intent prototypes
         self.intent_prototypes: Dict[str, List[str]] = {
@@ -52,14 +79,19 @@ class IntentRouter:
             ]
         }
 
-        # Precompute and normalize embeddings for fast dot-product/cosine comparison
-        self.prototype_embeddings = {
-            intent: self.embedder.encode(texts, normalize_embeddings=True)
-            for intent, texts in self.intent_prototypes.items()
-        }
+        try:
+            # Precompute normalized embeddings
+            self.prototype_embeddings = {
+                intent: self.embedder.encode(texts, normalize_embeddings=True)
+                for intent, texts in self.intent_prototypes.items()
+            }
+        except Exception:
+            logger.exception("Failed to compute prototype embeddings")
+            raise
 
         self.valid_intents = list(self.intent_prototypes.keys())
-        logger.info("[INTENT ROUTER] Ready.")
+
+        logger.info("IntentRouter initialized successfully.")
 
     # ============================================================
     # PUBLIC CLASSIFY METHOD
@@ -67,53 +99,60 @@ class IntentRouter:
 
     def classify(self, query: str) -> str:
         if not query or not query.strip():
+            logger.warning("Empty query received. Defaulting to general.")
             return "general"
 
-        # Step 1: Fast Embedding Similarity
-        intent, confidence = self._classify_cosine(query)
-        logger.debug(f"Cosine classification: {intent} (Score: {confidence:.2f})")
+        try:
+            # Step 1: Fast Embedding Similarity
+            intent, confidence = self._classify_cosine(query)
+            logger.debug(f"Cosine classification: {intent} (Score: {confidence:.2f})")
 
-        # Step 2: High Confidence Threshold Check
-        if confidence >= self.similarity_threshold:
-            return intent
+            # Step 2: High Confidence Threshold Check
+            if confidence >= self.similarity_threshold:
+                return intent
 
-        # Step 3: LLM Fallback for ambiguous queries
-        logger.info(f"[INTENT ROUTER] Low confidence ({confidence:.2f}). Falling back to LLM...")
-        return self._classify_llm(query)
+            # Step 3: LLM Fallback
+            logger.info(f"Low confidence ({confidence:.2f}). Falling back to LLM.")
+            return self._classify_llm(query)
+
+        except Exception:
+            logger.exception("Unhandled exception during classify(). Defaulting to general.")
+            return "general"
 
     # ============================================================
     # COSINE SIMILARITY CLASSIFICATION
     # ============================================================
 
     def _classify_cosine(self, query: str) -> Tuple[str, float]:
-        query_embedding = self.embedder.encode(
-            [query], 
-            normalize_embeddings=True
-        )
+        try:
+            query_embedding = self.embedder.encode(
+                [query],
+                normalize_embeddings=True
+            )
 
-        best_intent = "general"
-        best_score = 0.0
+            best_intent = "general"
+            best_score = 0.0
 
-        for intent, proto_embeds in self.prototype_embeddings.items():
-            # Calculate similarity against all prototypes for this intent
-            similarities = cosine_similarity(query_embedding, proto_embeds)
-            
-            # OPTIMIZATION: Use .max() instead of .mean() 
-            # We want to know if the query strongly matches AT LEAST ONE prototype
-            max_similarity = similarities.max()
+            for intent, proto_embeds in self.prototype_embeddings.items():
+                similarities = cosine_similarity(query_embedding, proto_embeds)
+                max_similarity = similarities.max()
 
-            if max_similarity > best_score:
-                best_score = max_similarity
-                best_intent = intent
+                if max_similarity > best_score:
+                    best_score = max_similarity
+                    best_intent = intent
 
-        return best_intent, float(best_score)
+            return best_intent, float(best_score)
+
+        except Exception:
+            logger.exception("Cosine similarity classification failed")
+            return "general", 0.0
 
     # ============================================================
     # LLM FALLBACK CLASSIFICATION
     # ============================================================
 
     def _classify_llm(self, query: str) -> str:
-        # Optimized prompt to force categorization
+
         prompt = f"""
 You are a strict query routing system. 
 Categorize the following user query into exactly ONE of these labels:
@@ -134,25 +173,28 @@ Label:"""
                     "prompt": prompt.strip(),
                     "stream": False,
                     "options": {
-                        "temperature": 0.0, # Zero temperature for deterministic classification
-                        "num_predict": 5    # Prevent long hallucinated responses
+                        "temperature": 0.0,
+                        "num_predict": 5
                     }
                 },
-                timeout=10 # Fail fast if Ollama is down
+                timeout=10
             )
-            response.raise_for_status() # Catch HTTP errors safely
-            
+
+            response.raise_for_status()
+
             result_text = response.json().get("response", "").strip().lower()
 
-            # Robust fuzzy parsing: Check if the valid label is *anywhere* in the response
             for intent in self.valid_intents:
                 if intent in result_text:
                     return intent
 
-            # If LLM outputs garbage, default to general
             logger.warning(f"LLM returned unrecognized intent: '{result_text}'. Defaulting to general.")
             return "general"
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"[INTENT ROUTER] LLM Fallback failed: {e}. Defaulting to general.")
+            logger.error(f"LLM fallback failed: {e}. Defaulting to general.")
+            return "general"
+
+        except Exception:
+            logger.exception("Unexpected error during LLM fallback")
             return "general"

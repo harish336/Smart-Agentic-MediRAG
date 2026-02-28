@@ -1,33 +1,25 @@
 """
 Frequency Analyzer (Standalone)
-
-Purpose:
-- Compute frequency statistics for text, numbers, sizes, labels
-- Used for:
-  - Header/footer detection
-  - Font-size dominance
-  - Page-number frequency
-  - Offset anchoring
-  - Noise removal
-
-This file CAN be run independently.
 """
 
 import sys
 import json
 from collections import Counter
-from pprint import pprint
-from typing import List, Any, Dict
+from pprint import pformat
+from typing import List, Any
+
+from core.utils.logging_utils import get_component_logger
+
+# =====================================================
+# LOGGER SETUP
+# =====================================================
+
+logger = get_component_logger("FrequencyAnalyzer", component="ingestion")
 
 
 class FrequencyAnalyzer:
+
     def __init__(self, data: List[Any]):
-        """
-        data:
-          - list of strings
-          - list of numbers
-          - list of dicts (with key extraction)
-        """
         self.data = data
         self.counter = Counter()
 
@@ -35,63 +27,74 @@ class FrequencyAnalyzer:
     # STEP 1: Build frequency map
     # -------------------------------------------------
     def compute(self):
-        print("[STEP 1] Computing frequency distribution...")
 
-        for item in self.data:
-            if item is None:
-                continue
+        logger.info("[STEP 1] Computing frequency distribution...")
 
-            if isinstance(item, dict):
-                self.counter.update(item.values())
-            elif isinstance(item, list):
-                self.counter.update(item)
-            else:
-                self.counter[item] += 1
+        try:
+            for item in self.data:
+                if item is None:
+                    continue
 
-        print("[INFO] Frequency computation completed")
-        return self.counter
+                if isinstance(item, dict):
+                    self.counter.update(item.values())
+                elif isinstance(item, list):
+                    self.counter.update(item)
+                else:
+                    self.counter[item] += 1
+
+            logger.info("Frequency computation completed")
+            return self.counter
+
+        except Exception:
+            logger.exception("Frequency computation failed")
+            raise
 
     # -------------------------------------------------
     # STEP 2: Get most common
     # -------------------------------------------------
     def most_common(self, n: int = 10):
-        print(f"\n[STEP 2] Fetching top {n} most common values")
+
+        logger.info(f"Fetching top {n} most common values")
         return self.counter.most_common(n)
 
     # -------------------------------------------------
     # STEP 3: Detect dominant value
     # -------------------------------------------------
     def dominant(self):
+
         if not self.counter:
-            print("[WARN] Counter empty — no dominant value")
+            logger.warning("Counter empty — no dominant value")
             return None
 
         dominant_value, count = self.counter.most_common(1)[0]
-        print(f"[DOMINANT] Value={dominant_value} | Count={count}")
+        logger.info(f"Dominant Value={dominant_value} | Count={count}")
         return dominant_value
 
     # -------------------------------------------------
     # STEP 4: Filter by minimum frequency
     # -------------------------------------------------
     def filter_min_frequency(self, min_count: int):
-        print(f"\n[STEP 4] Filtering items with frequency >= {min_count}")
+
+        logger.info(f"Filtering items with frequency >= {min_count}")
 
         filtered = {
             k: v for k, v in self.counter.items() if v >= min_count
         }
 
-        print(f"[INFO] Items after filtering: {len(filtered)}")
+        logger.info(f"Items after filtering: {len(filtered)}")
         return filtered
 
     # -------------------------------------------------
     # STEP 5: Normalize frequencies
     # -------------------------------------------------
     def normalize(self):
-        print("\n[STEP 5] Normalizing frequency values")
+
+        logger.info("Normalizing frequency values")
 
         total = sum(self.counter.values())
+
         if total == 0:
-            print("[WARN] Total frequency is zero")
+            logger.warning("Total frequency is zero")
             return {}
 
         normalized = {
@@ -105,56 +108,64 @@ class FrequencyAnalyzer:
     # RUN FULL ANALYSIS
     # -------------------------------------------------
     def run(self):
-        self.compute()
 
-        print("\n[SUMMARY]")
-        pprint(self.counter)
+        try:
+            self.compute()
 
-        print("\n[TOP 5]")
-        pprint(self.most_common(5))
+            logger.info("SUMMARY:")
+            logger.info(pformat(self.counter))
 
-        print("\n[DOMINANT VALUE]")
-        self.dominant()
+            logger.info("TOP 5:")
+            logger.info(pformat(self.most_common(5)))
 
-        return self.counter
+            logger.info("DOMINANT VALUE:")
+            self.dominant()
+
+            return self.counter
+
+        except Exception:
+            logger.exception("Frequency analysis failed")
+            raise
 
 
 # ============================================================
 # STANDALONE RUNNER
 # ============================================================
+
 def main():
+
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python frequency.py <input_json>")
-        print("\nExample input JSON formats:")
-        print("  ['a', 'b', 'a', 'c']")
-        print("  [12, 12, 13, 14]")
-        print("  [{'size': 12}, {'size': 12}, {'size': 14}]")
+        logger.warning("Usage: python frequency.py <input_json>")
         sys.exit(1)
 
     input_file = sys.argv[1]
 
-    print("=" * 100)
-    print("FREQUENCY ANALYZER STARTED")
-    print(f"Input file: {input_file}")
-    print("=" * 100)
+    logger.info("=" * 100)
+    logger.info("FREQUENCY ANALYZER STARTED")
+    logger.info(f"Input file: {input_file}")
+    logger.info("=" * 100)
 
     try:
         with open(input_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception as e:
-        print(f"[ERROR] Failed to load input JSON: {e}")
+    except Exception:
+        logger.exception("Failed to load input JSON")
         sys.exit(1)
 
-    analyzer = FrequencyAnalyzer(data)
-    counter = analyzer.run()
+    try:
+        analyzer = FrequencyAnalyzer(data)
+        counter = analyzer.run()
 
-    print("\n[FINAL FREQUENCY MAP]")
-    pprint(counter)
+        logger.info("FINAL FREQUENCY MAP:")
+        logger.info(pformat(counter))
 
-    print("=" * 100)
-    print("FREQUENCY ANALYZER COMPLETED")
-    print("=" * 100)
+    except Exception:
+        logger.exception("Frequency analyzer crashed")
+        sys.exit(1)
+
+    logger.info("=" * 100)
+    logger.info("FREQUENCY ANALYZER COMPLETED")
+    logger.info("=" * 100)
 
 
 if __name__ == "__main__":

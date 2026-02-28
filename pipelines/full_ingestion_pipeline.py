@@ -1,27 +1,29 @@
 """
 SMART MEDIRAG — FULL INGESTION PIPELINE
-
-Runs complete flow:
-PDF → TOC → Offset → Style → Chunk → Clean →
-Validate → Embed → Vector Store → Emotion →
-Graph Store
 """
 
 import uuid
-from pprint import pprint
 
 # -------------------------------
 # CORE MODULES
 # -------------------------------
 
 from core.toc.orchestrator import TOCOrchestrator
-from core.chunking.orchestrator import ChunkOrchestrator  # assume exists
+from core.chunking.orchestrator import ChunkOrchestrator
 from core.utils.text_cleaner import TextCleaner
 
 from core.vector.orchestrator import VectorOrchestrator
 from core.graph.orchestrator import GraphOrchestrator
 
 from config.system_loader import get_system_config
+from core.utils.logging_utils import get_component_logger
+
+
+# =====================================================
+# LOGGER SETUP
+# =====================================================
+
+logger = get_component_logger("FullIngestionPipeline", component="ingestion")
 
 
 # =====================================================
@@ -32,19 +34,21 @@ class FullIngestionPipeline:
 
     def __init__(self, pdf_path: str):
 
-        print("\n" + "=" * 100)
-        print("SMART MEDIRAG — FULL INGESTION PIPELINE")
-        print("=" * 100)
+        logger.info("\n" + "=" * 100)
+        logger.info("SMART MEDIRAG — FULL INGESTION PIPELINE")
+        logger.info("=" * 100)
 
         self.pdf_path = pdf_path
         self.doc_id = f"doc_{uuid.uuid4().hex[:8]}"
 
-        self.cleaner = TextCleaner()
-
-        self.vector_orch = VectorOrchestrator(self.pdf_path)
-        self.graph_orch = GraphOrchestrator(self.vector_orch.document_id)
-
-        self.config = get_system_config()
+        try:
+            self.cleaner = TextCleaner()
+            self.vector_orch = VectorOrchestrator(self.pdf_path)
+            self.graph_orch = GraphOrchestrator(self.vector_orch.document_id)
+            self.config = get_system_config()
+        except Exception:
+            logger.exception("Pipeline initialization failed")
+            raise
 
     # =====================================================
     # STEP 1 — TOC + OFFSET
@@ -52,15 +56,20 @@ class FullIngestionPipeline:
 
     def process_structure(self):
 
-        print("\n[PIPELINE] STEP 1 — TOC + STRUCTURE")
+        logger.info("[PIPELINE] STEP 1 — TOC + STRUCTURE")
 
-        toc_orch = TOCOrchestrator(self.pdf_path)
-        toc_data = toc_orch.run()
+        try:
+            toc_orch = TOCOrchestrator(self.pdf_path)
+            toc_data = toc_orch.run()
 
-        if not toc_data:
-            print("[PIPELINE] No TOC found — fallback chunking")
+            if not toc_data:
+                logger.warning("No TOC found — fallback chunking")
 
-        return toc_data
+            return toc_data
+
+        except Exception:
+            logger.exception("TOC processing failed")
+            raise
 
     # =====================================================
     # STEP 2 — SMART CHUNKING
@@ -68,18 +77,23 @@ class FullIngestionPipeline:
 
     def chunk_document(self, toc_data):
 
-        print("\n[PIPELINE] STEP 2 — SMART CHUNKING")
+        logger.info("[PIPELINE] STEP 2 — SMART CHUNKING")
 
-        chunk_orch = ChunkOrchestrator(
-            pdf_path=self.pdf_path,
-            toc_data=toc_data
-        )
+        try:
+            chunk_orch = ChunkOrchestrator(
+                pdf_path=self.pdf_path,
+                toc_data=toc_data
+            )
 
-        chunks = chunk_orch.run()
+            chunks = chunk_orch.run()
 
-        print(f"[PIPELINE] Generated {len(chunks)} chunks")
+            logger.info(f"Generated {len(chunks)} chunks")
 
-        return chunks
+            return chunks
+
+        except Exception:
+            logger.exception("Chunking failed")
+            raise
 
     # =====================================================
     # STEP 3 — CLEAN CHUNKS
@@ -87,12 +101,17 @@ class FullIngestionPipeline:
 
     def clean_chunks(self, chunks):
 
-        print("\n[PIPELINE] STEP 3 — CLEANING")
+        logger.info("[PIPELINE] STEP 3 — CLEANING")
 
-        for chunk in chunks:
-            chunk["text"] = self.cleaner.clean(chunk["text"])
+        try:
+            for chunk in chunks:
+                chunk["text"] = self.cleaner.clean(chunk["text"])
 
-        return chunks
+            return chunks
+
+        except Exception:
+            logger.exception("Chunk cleaning failed")
+            raise
 
     # =====================================================
     # STEP 4 — VECTOR STORE
@@ -100,11 +119,15 @@ class FullIngestionPipeline:
 
     def store_vector(self, chunks):
 
-        print("\n[PIPELINE] STEP 4 — VECTOR STORAGE")
+        logger.info("[PIPELINE] STEP 4 — VECTOR STORAGE")
 
-        self.vector_orch.ingest(
-            chunks=chunks
-        )
+        try:
+            self.vector_orch.ingest(
+                chunks=chunks
+            )
+        except Exception:
+            logger.exception("Vector storage failed")
+            raise
 
     # =====================================================
     # STEP 5 — GRAPH STORE
@@ -112,21 +135,26 @@ class FullIngestionPipeline:
 
     def store_graph(self, chunks):
 
-        print("\n[PIPELINE] STEP 5 — GRAPH STORAGE")
+        logger.info("[PIPELINE] STEP 5 — GRAPH STORAGE")
 
-        for chunk in chunks:
+        try:
+            for chunk in chunks:
 
-            chunk_payload = {
-                "doc_id": self.doc_id,
-                "chapter": chunk.get("chapter"),
-                "subheading": chunk.get("subheading"),
-                "chunk_id": chunk["chunk_id"],
-                "text": chunk["text"],
-                "page_label": chunk.get("page_label"),
-                "page_physical": chunk.get("page_physical")
-            }
+                chunk_payload = {
+                    "doc_id": self.doc_id,
+                    "chapter": chunk.get("chapter"),
+                    "subheading": chunk.get("subheading"),
+                    "chunk_id": chunk["chunk_id"],
+                    "text": chunk["text"],
+                    "page_label": chunk.get("page_label"),
+                    "page_physical": chunk.get("page_physical")
+                }
 
-            self.graph_orch.ingest_chunks([chunk_payload])
+                self.graph_orch.ingest_chunks([chunk_payload])
+
+        except Exception:
+            logger.exception("Graph storage failed")
+            raise
 
     # =====================================================
     # RUN PIPELINE
@@ -134,34 +162,37 @@ class FullIngestionPipeline:
 
     def run(self):
 
-        # STEP 1
-        toc_data = self.process_structure()
+        try:
+            toc_data = self.process_structure()
 
-        # STEP 2
-        chunks = self.chunk_document(toc_data)
+            chunks = self.chunk_document(toc_data)
 
-        if not chunks:
-            print("[PIPELINE] No chunks generated — stopping")
-            return
+            if not chunks:
+                logger.warning("No chunks generated — stopping pipeline")
+                return
 
-        # Attach doc_id
-        for chunk in chunks:
-            chunk["doc_id"] = self.doc_id
+            for chunk in chunks:
+                chunk["doc_id"] = self.doc_id
 
-        # STEP 3
-        chunks = self.clean_chunks(chunks)
+            chunks = self.clean_chunks(chunks)
 
-        # STEP 4
-        self.store_vector(chunks)
+            self.store_vector(chunks)
 
-        # STEP 5
-        self.store_graph(chunks)
+            self.store_graph(chunks)
 
-        print("\n" + "=" * 100)
-        print("FULL INGESTION COMPLETED SUCCESSFULLY")
-        print("=" * 100)
+            logger.info("\n" + "=" * 100)
+            logger.info("FULL INGESTION COMPLETED SUCCESSFULLY")
+            logger.info("=" * 100)
 
-        self.graph_orch.close()
+        except Exception:
+            logger.exception("Full ingestion pipeline failed")
+            raise
+
+        finally:
+            try:
+                self.graph_orch.close()
+            except Exception:
+                logger.exception("Failed closing graph connection")
 
 
 # =====================================================
@@ -173,14 +204,18 @@ def main():
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python -m pipelines.full_ingestion_pipeline <pdf_path>")
+        logger.warning(
+            "Usage: python -m pipelines.full_ingestion_pipeline <pdf_path>"
+        )
         return
 
     pdf_path = sys.argv[1]
 
-    pipeline = FullIngestionPipeline(pdf_path)
-    pipeline.run()
+    try:
+        pipeline = FullIngestionPipeline(pdf_path)
+        pipeline.run()
+    except Exception:
+        logger.exception("Pipeline execution crashed")
 
 
 if __name__ == "__main__":

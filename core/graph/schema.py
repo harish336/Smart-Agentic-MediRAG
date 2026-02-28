@@ -80,3 +80,17 @@ CREATE_CONSTRAINTS = [
     REQUIRE e.{NAME} IS UNIQUE
     """
 ]
+
+# =====================================================
+# INDEXES (FOR FAST RETRIEVAL)
+# =====================================================
+
+CHUNK_TEXT_FULLTEXT_INDEX = "chunkTextIndex"
+
+CREATE_INDEXES = [
+    f"""
+    CREATE FULLTEXT INDEX {CHUNK_TEXT_FULLTEXT_INDEX} IF NOT EXISTS
+    FOR (c:{CHUNK})
+    ON EACH [c.{TEXT}]
+    """
+]

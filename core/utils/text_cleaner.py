@@ -1,173 +1,157 @@
 """
 Text Cleaner (Standalone & Verbose)
-
-Purpose:
-- Clean raw text extracted from PDFs, OCR, TOC, chunks
-- Normalize whitespace and punctuation
-- Remove common noise patterns
-- Prepare text for chunking and embeddings
-
-Used in:
-- TOC extraction
-- OCR cleanup
-- Chunk preparation
-- Vector DB ingestion
-
-This file CAN be run independently.
 """
 
 import sys
 import json
 import re
-from pprint import pprint
-from typing import Union, List
+from pprint import pformat
+from typing import List
+
+from core.utils.logging_utils import get_component_logger
+
+# =====================================================
+# LOGGER SETUP
+# =====================================================
+
+logger = get_component_logger("TextCleaner", component="ingestion")
 
 
 class TextCleaner:
+
     def __init__(self, aggressive: bool = False):
-        """
-        aggressive:
-          False → safe cleaning (recommended)
-          True  → aggressive cleanup (OCR-heavy docs)
-        """
         self.aggressive = aggressive
 
     # -------------------------------------------------
-    # STEP 1: Normalize whitespace
-    # -------------------------------------------------
     def normalize_whitespace(self, text: str) -> str:
-        print("[CLEAN] Normalizing whitespace")
+        logger.debug("Normalizing whitespace")
         text = re.sub(r"\s+", " ", text)
         return text.strip()
 
     # -------------------------------------------------
-    # STEP 2: Remove dotted leaders (TOC)
-    # -------------------------------------------------
     def remove_dotted_leaders(self, text: str) -> str:
-        print("[CLEAN] Removing dotted leaders")
-        text = re.sub(r"\.{2,}", " ", text)
-        return text
+        logger.debug("Removing dotted leaders")
+        return re.sub(r"\.{2,}", " ", text)
 
-    # -------------------------------------------------
-    # STEP 3: Remove repeated hyphens/underscores
     # -------------------------------------------------
     def remove_repeated_symbols(self, text: str) -> str:
-        print("[CLEAN] Removing repeated symbols")
-        text = re.sub(r"[-_]{2,}", " ", text)
-        return text
+        logger.debug("Removing repeated symbols")
+        return re.sub(r"[-_]{2,}", " ", text)
 
-    # -------------------------------------------------
-    # STEP 4: Fix broken line words (hyphenated OCR)
     # -------------------------------------------------
     def fix_hyphenated_words(self, text: str) -> str:
-        print("[CLEAN] Fixing hyphenated line breaks")
-        text = re.sub(r"(\w+)-\s+(\w+)", r"\1\2", text)
-        return text
+        logger.debug("Fixing hyphenated line breaks")
+        return re.sub(r"(\w+)-\s+(\w+)", r"\1\2", text)
 
-    # -------------------------------------------------
-    # STEP 5: Remove non-printable characters
     # -------------------------------------------------
     def remove_non_printable(self, text: str) -> str:
-        print("[CLEAN] Removing non-printable characters")
-        text = "".join(c for c in text if c.isprintable())
-        return text
+        logger.debug("Removing non-printable characters")
+        return "".join(c for c in text if c.isprintable())
 
-    # -------------------------------------------------
-    # STEP 6: Aggressive OCR cleanup (optional)
     # -------------------------------------------------
     def aggressive_cleanup(self, text: str) -> str:
-        print("[CLEAN] Applying aggressive OCR cleanup")
+        logger.debug("Applying aggressive OCR cleanup")
 
-        # Remove isolated symbols
         text = re.sub(r"\b[^a-zA-Z0-9\s]{1,2}\b", " ", text)
-
-        # Remove excessive punctuation
         text = re.sub(r"[!?]{2,}", ".", text)
-
-        # Remove random single letters
         text = re.sub(r"\b[a-zA-Z]\b", " ", text)
 
         return text
 
     # -------------------------------------------------
-    # RUN CLEANING PIPELINE
-    # -------------------------------------------------
     def clean(self, text: str) -> str:
-        print("\n[TEXT CLEANING STARTED]")
-        print(f"[INPUT LENGTH] {len(text)}")
 
-        text = self.remove_non_printable(text)
-        text = self.fix_hyphenated_words(text)
-        text = self.remove_dotted_leaders(text)
-        text = self.remove_repeated_symbols(text)
-        text = self.normalize_whitespace(text)
+        try:
+            logger.info("TEXT CLEANING STARTED")
+            logger.info(f"Input length: {len(text)}")
 
-        if self.aggressive:
-            text = self.aggressive_cleanup(text)
+            text = self.remove_non_printable(text)
+            text = self.fix_hyphenated_words(text)
+            text = self.remove_dotted_leaders(text)
+            text = self.remove_repeated_symbols(text)
             text = self.normalize_whitespace(text)
 
-        print(f"[OUTPUT LENGTH] {len(text)}")
-        print("[TEXT CLEANING COMPLETED]\n")
+            if self.aggressive:
+                text = self.aggressive_cleanup(text)
+                text = self.normalize_whitespace(text)
 
-        return text
+            logger.info(f"Output length: {len(text)}")
+            logger.info("TEXT CLEANING COMPLETED")
 
-    # -------------------------------------------------
-    # Clean list of texts
+            return text
+
+        except Exception:
+            logger.exception("Text cleaning failed")
+            raise
+
     # -------------------------------------------------
     def clean_list(self, texts: List[str]) -> List[str]:
-        print(f"[BATCH CLEAN] Cleaning list of {len(texts)} texts")
-        return [self.clean(t) for t in texts if isinstance(t, str)]
+
+        logger.info(f"Batch cleaning {len(texts)} texts")
+
+        try:
+            return [
+                self.clean(t)
+                for t in texts
+                if isinstance(t, str)
+            ]
+        except Exception:
+            logger.exception("Batch text cleaning failed")
+            raise
 
 
 # ============================================================
 # STANDALONE RUNNER
 # ============================================================
+
 def main():
+
     if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python text_cleaner.py <text_or_json> [--aggressive]")
-        print("\nExamples:")
-        print("  python text_cleaner.py \"Some raw text...\"")
-        print("  python text_cleaner.py texts.json --aggressive")
+        logger.warning(
+            "Usage: python text_cleaner.py <text_or_json> [--aggressive]"
+        )
         sys.exit(1)
 
     input_value = sys.argv[1]
     aggressive = "--aggressive" in sys.argv
 
-    print("=" * 100)
-    print("TEXT CLEANER STARTED")
-    print(f"Aggressive mode: {aggressive}")
-    print("=" * 100)
+    logger.info("=" * 100)
+    logger.info("TEXT CLEANER STARTED")
+    logger.info(f"Aggressive mode: {aggressive}")
+    logger.info("=" * 100)
 
     cleaner = TextCleaner(aggressive=aggressive)
 
-    # JSON input
-    if input_value.lower().endswith(".json"):
-        try:
+    try:
+
+        # JSON input
+        if input_value.lower().endswith(".json"):
+
             with open(input_value, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception as e:
-            print(f"[ERROR] Failed to load JSON: {e}")
-            sys.exit(1)
 
-        if isinstance(data, list):
+            if not isinstance(data, list):
+                logger.error("JSON must contain a list of strings")
+                sys.exit(1)
+
             cleaned = cleaner.clean_list(data)
+
+            logger.info("CLEANED OUTPUT:")
+            logger.info(pformat(cleaned))
+
+        # Direct text input
         else:
-            print("[ERROR] JSON must contain a list of strings")
-            sys.exit(1)
+            cleaned = cleaner.clean(input_value)
+            logger.info("CLEANED OUTPUT:")
+            logger.info(cleaned)
 
-        print("\n[CLEANED OUTPUT]")
-        pprint(cleaned)
+    except Exception:
+        logger.exception("Text cleaner crashed")
+        sys.exit(1)
 
-    # Direct text input
-    else:
-        cleaned = cleaner.clean(input_value)
-        print("\n[CLEANED OUTPUT]")
-        print(cleaned)
-
-    print("=" * 100)
-    print("TEXT CLEANER COMPLETED")
-    print("=" * 100)
+    logger.info("=" * 100)
+    logger.info("TEXT CLEANER COMPLETED")
+    logger.info("=" * 100)
 
 
 if __name__ == "__main__":
