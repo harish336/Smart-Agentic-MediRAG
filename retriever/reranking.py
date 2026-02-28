@@ -1,5 +1,5 @@
 """
-SmartChunk-RAG — Cross-Encoder Reranker (Production Hybrid Version)
+SmartChunk-RAG — Cross-Encoder Reranker (BGE Large | GPU Optimized)
 """
 
 import torch
@@ -14,7 +14,6 @@ from core.utils.logging_utils import get_component_logger
 
 logger = get_component_logger("CrossEncoderReranker", component="retrieval")
 
-
 # =====================================================
 # LAZY SINGLETON MODEL
 # =====================================================
@@ -23,6 +22,10 @@ _cross_encoder_instance: Optional[CrossEncoder] = None
 
 
 def get_cross_encoder(model_name: str, device: str) -> CrossEncoder:
+    """
+    Lazy-load CrossEncoder model (singleton pattern)
+    """
+
     global _cross_encoder_instance
 
     if _cross_encoder_instance is None:
@@ -31,8 +34,13 @@ def get_cross_encoder(model_name: str, device: str) -> CrossEncoder:
 
             _cross_encoder_instance = CrossEncoder(
                 model_name,
-                device=device
+                device=device,
+                max_length=1024
             )
+
+            # Move to FP16 if GPU available
+            if device == "cuda":
+                _cross_encoder_instance.model = _cross_encoder_instance.model.half()
 
             logger.info("CrossEncoder model loaded successfully.")
 
@@ -49,19 +57,19 @@ def get_cross_encoder(model_name: str, device: str) -> CrossEncoder:
 
 class CrossEncoderReranker:
     """
-    Hybrid-aware Cross-Encoder reranker.
-    Designed for production RAG systems.
+    GPU-optimized BGE Large Cross-Encoder Reranker
+    Designed for high-precision hybrid RAG systems.
     """
 
     def __init__(
         self,
-        model_name: str = "cross-encoder/ms-marco-MiniLM-L-12-v2",
-        batch_size: int = 16,
-        max_text_length: int = 800
+        model_name: str = "BAAI/bge-reranker-large",
+        batch_size: int = 32,              # Optimized for RTX 5070
+        max_text_length: int = 1024
     ):
 
         logger.info("=" * 80)
-        logger.info("Initializing Cross-Encoder Reranker")
+        logger.info("Initializing Cross-Encoder Reranker (BGE Large)")
         logger.info("=" * 80)
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -99,7 +107,6 @@ class CrossEncoderReranker:
             return []
 
         try:
-
             # --------------------------------------------------
             # 1️⃣ Clean + Truncate Candidates
             # --------------------------------------------------
@@ -107,16 +114,18 @@ class CrossEncoderReranker:
             clean_candidates = []
 
             for c in candidates:
-
                 text = c.get("text")
 
                 if not text or not isinstance(text, str):
                     continue
 
                 # Truncate overly long text
-                c["text"] = text[:self.max_text_length]
+                truncated = text[:self.max_text_length]
 
-                clean_candidates.append(c)
+                clean_candidates.append({
+                    **c,
+                    "text": truncated
+                })
 
             if not clean_candidates:
                 logger.warning("All candidates invalid after filtering.")
@@ -126,10 +135,7 @@ class CrossEncoderReranker:
             # 2️⃣ Build Query-Document Pairs
             # --------------------------------------------------
 
-            pairs = [
-                (query, c["text"])
-                for c in clean_candidates
-            ]
+            pairs = [(query, c["text"]) for c in clean_candidates]
 
             # --------------------------------------------------
             # 3️⃣ Predict Scores
@@ -153,6 +159,9 @@ class CrossEncoderReranker:
                 reverse=True
             )
 
+            max_score = clean_candidates[0]["rerank_score"]
+            logger.info(f"Max rerank score: {max_score:.4f}")
+
             return clean_candidates[:top_k]
 
         except Exception:
@@ -166,21 +175,23 @@ class CrossEncoderReranker:
     def _predict_scores(self, pairs):
 
         try:
+            with torch.no_grad():
 
-            if self.use_fp16:
-                with torch.cuda.amp.autocast():
+                if self.use_fp16:
+                    with torch.cuda.amp.autocast():
+                        scores = self.model.predict(
+                            pairs,
+                            batch_size=self.batch_size,
+                            convert_to_numpy=True
+                        )
+                else:
                     scores = self.model.predict(
                         pairs,
                         batch_size=self.batch_size,
                         convert_to_numpy=True
                     )
-            else:
-                scores = self.model.predict(
-                    pairs,
-                    batch_size=self.batch_size,
-                    convert_to_numpy=True
-                )
 
+            # IMPORTANT: Do NOT apply sigmoid
             return scores
 
         except Exception:

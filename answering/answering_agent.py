@@ -117,7 +117,7 @@ class AnsweringAgent:
     # PUBLIC API
     # ============================================================
 
-    def answer(self, query: str) -> Dict:
+    def answer(self, query: str, retrieval_query: Optional[str] = None) -> Dict:
         """
         Main RAG execution method.
         Expects a fully prepared query (memory already injected if needed).
@@ -162,13 +162,34 @@ class AnsweringAgent:
             # 2️⃣ Retrieval
             # -----------------------------------------------
 
+            search_query = retrieval_query or query
+
             results = self.retriever.retrieve(
-                query=query,
+                query=search_query,
                 mode="hybrid",
-                top_k=15
+                top_k=5,
+                initial_k=20
             )
 
-            context_chunks = results[:15] if results else []
+            if not results:
+                return {
+                    "response": "dont have an answer",
+                    "citations": [],
+                    "follow_up": self._build_follow_up(query, intent)
+                }
+            
+            max_rerank_score = max(r.get("rerank_score", 0) for r in results)
+
+            RERANK_THRESHOLD = 0.10
+
+            if max_rerank_score < RERANK_THRESHOLD:
+                return {
+                    "response": "dont have an answer",
+                    "citations": [],
+                    "follow_up": self._build_follow_up(query, intent)
+                }
+
+            context_chunks = results[:5]  # reduce from 15 to 5
 
             # -----------------------------------------------
             # 3️⃣ Prompt Building

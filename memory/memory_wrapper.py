@@ -103,7 +103,10 @@ Instruction:
             # Call Pure RAG Agent
             # --------------------------------------------
 
-            result = self.agent.answer(enriched_query)
+            result = self.agent.answer(
+                query=enriched_query,       # used for prompt
+                retrieval_query=query       # ONLY clean user question
+            )
 
             # --------------------------------------------
             # Persist STM
