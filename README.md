@@ -1,4 +1,4 @@
-# Smart Medirag - ChatGPT-Style Full Stack App
+# Smart Medirag
 
 Flask + React (Vite) app with:
 - JWT authentication (access + refresh tokens)
