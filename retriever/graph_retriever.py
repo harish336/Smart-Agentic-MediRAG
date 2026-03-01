@@ -286,17 +286,20 @@ class GraphRetriever(BaseRetriever):
     # =====================================================
 
     def _deduplicate(self, results: List[Dict]) -> List[Dict]:
-
-        seen = set()
-        unique = []
+        """Deduplicate results using (doc_id, chunk_id) tuple as unique key."""
+        best = {}
 
         for r in results:
-            cid = r["chunk_id"]
-            if cid not in seen:
-                seen.add(cid)
-                unique.append(r)
+            unique_key = (r.get("doc_id"), r.get("chunk_id"))
 
-        return unique
+            if unique_key not in best:
+                best[unique_key] = r
+            else:
+                # Keep the result with higher score
+                if r.get("score", 0) > best[unique_key].get("score", 0):
+                    best[unique_key] = r
+
+        return list(best.values())
 
     # =====================================================
     # RANKING
@@ -366,10 +369,15 @@ class GraphRetriever(BaseRetriever):
 
                 doc_id = result[0]["doc_id"]
 
-            return self._expand_multihop(
+            expanded = self._expand_multihop(
                 [{"chunk_id": chunk_id}],
                 doc_id
             )
+            
+            # Deduplicate expanded results to prevent duplicates
+            expanded = self._deduplicate(expanded)
+            
+            return expanded
 
         except Exception:
             logger.exception("expand_chunk_context failed")

@@ -1,21 +1,14 @@
-"""
-SmartChunk-RAG — Answering Agent (Pure RAG Production Version)
+﻿"""
+SmartChunk-RAG  Answering Agent (Pure RAG Production Version)
 
 This agent:
 - Performs intent detection
-- Performs hybrid retrieval
-- Builds grounded prompt
+- Performs hybrid retrieval for medical/book queries
+- Supports companion mode for normal conversation
+- Builds grounded prompts
 - Calls LLM
 - Formats response
-- Adds citations
-
-It does NOT:
-- Manage memory
-- Manage threads
-- Handle user_id
-- Classify transformation queries
-
-Memory logic must live in MemoryWrappedAnsweringAgent.
+- Adds citations for evidence-mode answers
 """
 
 import os
@@ -30,24 +23,14 @@ from answering.response_formatter import ResponseFormatter
 from core.utils.logging_utils import get_component_logger
 
 
-# ============================================================
-# LOGGER CONFIG
-# ============================================================
-
 logger = get_component_logger("AnsweringAgent", component="answering")
-
-
-# ============================================================
-# LLM CONFIG
-# ============================================================
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b-instruct")
-
-
-# ============================================================
-# Lazy Singletons
-# ============================================================
+CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", DEFAULT_MODEL)
+KNOWLEDGE_MODEL = os.getenv("OLLAMA_KNOWLEDGE_MODEL", DEFAULT_MODEL)
+MEDICAL_RERANK_THRESHOLD = float(os.getenv("MEDICAL_RERANK_THRESHOLD", "0.18"))
+BOOK_RERANK_THRESHOLD = float(os.getenv("BOOK_RERANK_THRESHOLD", "0.05"))
 
 _router_instance: Optional[IntentRouter] = None
 _retriever_instance: Optional[RetrieverOrchestrator] = None
@@ -91,84 +74,75 @@ def get_formatter():
     return _formatter_instance
 
 
-# ============================================================
-# ANSWERING AGENT (PURE RAG)
-# ============================================================
-
 class AnsweringAgent:
 
     def __init__(self, model: str = DEFAULT_MODEL):
-
         logger.info("=" * 80)
-        logger.info("Initializing AnsweringAgent (Pure RAG)")
+        logger.info("Initializing AnsweringAgent (Companion + Evidence RAG)")
         logger.info("=" * 80)
 
         self.model = model
+        self.chat_model = CHAT_MODEL
+        self.knowledge_model = KNOWLEDGE_MODEL
         self.router = None
         self.retriever = None
         self.prompt_builder = None
         self.citation_manager = None
         self.formatter = None
 
-        logger.info(f"Model: {self.model}")
+        logger.info("Default model: %s", self.model)
+        logger.info("Chat model: %s", self.chat_model)
+        logger.info("Knowledge model: %s", self.knowledge_model)
         logger.info("=" * 80)
 
-    # ============================================================
-    # PUBLIC API
-    # ============================================================
-
     def answer(self, query: str, retrieval_query: Optional[str] = None) -> Dict:
-        """
-        Main RAG execution method.
-        Expects a fully prepared query (memory already injected if needed).
-        """
-
         if not query or not query.strip():
-            return {
-                "response": "",
-                "citations": [],
-                "follow_up": ""
-            }
+            return {"response": "", "citations": [], "follow_up": ""}
 
         try:
-
-            # -----------------------------------------------
-            # Lazy Load Dependencies
-            # -----------------------------------------------
-
             if self.router is None:
                 self.router = get_router()
-
-            if self.retriever is None:
-                self.retriever = get_retriever()
-
             if self.prompt_builder is None:
                 self.prompt_builder = get_prompt_builder()
-
-            if self.citation_manager is None:
-                self.citation_manager = get_citation_manager()
-
             if self.formatter is None:
                 self.formatter = get_formatter()
 
-            # -----------------------------------------------
-            # 1️⃣ Intent Detection
-            # -----------------------------------------------
+            # Use clean user query for routing when memory/context has been injected.
+            intent_input = retrieval_query or query
+            intent = self.router.classify(intent_input)
+            logger.info("Intent detected: %s", intent)
 
-            intent = self.router.classify(query)
-            logger.info(f"Intent detected: {intent}")
+            # Companion mode: normal conversation without forced retrieval.
+            if intent == "general":
+                prompt = self.prompt_builder.build_companion(query=query)
+                llm_response = self._call_llm(
+                    prompt=prompt,
+                    model=self.chat_model,
+                    generation_mode="creative_chat",
+                )
+                formatted_response = self.formatter.format(llm_response, intent="general")
 
-            # -----------------------------------------------
-            # 2️⃣ Retrieval
-            # -----------------------------------------------
+                if not formatted_response:
+                    formatted_response = "I'm here with you. Tell me a bit more so I can help properly."
+
+                return {
+                    "response": formatted_response,
+                    "citations": [],
+                    "follow_up": ""
+                }
+
+            # Evidence mode for medical/book intents.
+            if self.retriever is None:
+                self.retriever = get_retriever()
+            if self.citation_manager is None:
+                self.citation_manager = get_citation_manager()
 
             search_query = retrieval_query or query
-
             results = self.retriever.retrieve(
                 query=search_query,
                 mode="hybrid",
-                top_k=5,
-                initial_k=20
+                top_k=8,
+                initial_k=25
             )
 
             if not results:
@@ -177,23 +151,23 @@ class AnsweringAgent:
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent)
                 }
-            
-            max_rerank_score = max(r.get("rerank_score", 0) for r in results)
 
-            RERANK_THRESHOLD = 0.10
-
-            if max_rerank_score < RERANK_THRESHOLD:
+            max_rerank_score = max(float(r.get("rerank_score", 0.0) or 0.0) for r in results)
+            rerank_threshold = MEDICAL_RERANK_THRESHOLD if intent == "medical" else BOOK_RERANK_THRESHOLD
+            logger.info(
+                "Rerank gate check | intent=%s max_rerank_score=%.4f threshold=%.4f",
+                intent,
+                max_rerank_score,
+                rerank_threshold,
+            )
+            if max_rerank_score < rerank_threshold:
                 return {
-                    "response": "dont have an answer",
+                    "response": "Dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent)
                 }
 
-            context_chunks = results[:5]  # reduce from 15 to 5
-
-            # -----------------------------------------------
-            # 3️⃣ Prompt Building
-            # -----------------------------------------------
+            context_chunks = results[:6]
 
             prompt = self.prompt_builder.build(
                 query=query,
@@ -201,41 +175,34 @@ class AnsweringAgent:
                 intent=intent
             )
 
-            # -----------------------------------------------
-            # 4️⃣ LLM Call
-            # -----------------------------------------------
-
             llm_response = self._call_llm(prompt)
-
             if not llm_response:
                 return {
-                    "response": "",
+                    "response": "Dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent)
                 }
 
-            # -----------------------------------------------
-            # 5️⃣ Format Response
-            # -----------------------------------------------
-
-            formatted_response = self.formatter.format(llm_response)
-            follow_up = ""
+            formatted_response = self.formatter.format(llm_response, intent=intent)
             if self._needs_follow_up(formatted_response):
-                follow_up = self._build_follow_up(query, intent)
+                return {
+                    "response": "Dont have an answer",
+                    "citations": [],
+                    "follow_up": self._build_follow_up(query, intent)
+                }
 
-            # -----------------------------------------------
-            # 6️⃣ Citations
-            # -----------------------------------------------
-
-            citations = []
-
-            if intent in ["medical", "book"] and results:
-                citations = self.citation_manager.build(results)
+            citations = self.citation_manager.build(context_chunks)
+            if not citations:
+                return {
+                    "response": "Dont have an answer",
+                    "citations": [],
+                    "follow_up": self._build_follow_up(query, intent)
+                }
 
             return {
                 "response": formatted_response,
                 "citations": citations,
-                "follow_up": follow_up
+                "follow_up": ""
             }
 
         except Exception:
@@ -246,24 +213,31 @@ class AnsweringAgent:
                 "follow_up": self._build_follow_up(query, "general")
             }
 
-    # ============================================================
-    # LLM CALL
-    # ============================================================
+    def _call_llm(self, prompt: str, model: Optional[str] = None, generation_mode: str = "grounded") -> str:
+        selected_model = model or self.knowledge_model or self.model
+        options = {
+            "temperature": 0.1,
+            "top_p": 0.2,
+            "top_k": 30,
+            "repeat_penalty": 1.1,
+            "seed": 42,
+            "num_predict": 700
+        }
 
-    def _call_llm(self, prompt: str) -> str:
+        if generation_mode == "creative_chat":
+            options = {
+                "temperature": 0.8,
+                "top_p": 0.9,
+                "top_k": 60,
+                "repeat_penalty": 1.05,
+                "num_predict": 700
+            }
 
         payload = {
-            "model": self.model,
+            "model": selected_model,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": 0.0,
-                "top_p": 0.15,
-                "top_k": 20,
-                "repeat_penalty": 1.1,
-                "seed": 42,
-                "num_predict": 600
-            }
+            "options": options
         }
 
         try:
@@ -274,18 +248,27 @@ class AnsweringAgent:
             )
 
             if response.status_code != 200:
-                logger.error(f"LLM error: {response.status_code}")
+                logger.error("LLM error: %s body=%s", response.status_code, response.text[:500])
                 return ""
 
-            return response.json().get("response", "").strip()
+            payload_json = response.json()
+            llm_response = (payload_json.get("response", "") or "").strip()
+
+            # Persist raw LLM output in answering.log for traceability/debugging.
+            logger.info(
+                "LLM_RESPONSE_START model=%s mode=%s chars=%d",
+                selected_model,
+                generation_mode,
+                len(llm_response),
+            )
+            logger.info("%s", llm_response if llm_response else "<empty>")
+            logger.info("LLM_RESPONSE_END")
+
+            return llm_response
 
         except Exception:
             logger.exception("LLM connection failure")
             return ""
-
-    # ============================================================
-    # FOLLOW-UP QUESTION HANDLING
-    # ============================================================
 
     def _needs_follow_up(self, response_text: str) -> bool:
         if not response_text:
@@ -294,7 +277,7 @@ class AnsweringAgent:
 
     def _build_follow_up(self, query: str, intent: str) -> str:
         if intent == "medical":
-            return "Can you provide more specific symptoms, duration, or relevant history so I can answer accurately?"
+            return "Can you share symptoms, duration, severity, and relevant history so I can answer accurately?"
         if intent == "book":
-            return "Which chapter, section, or page should I focus on for this question?"
-        return "Can you clarify your question or add more details so I can answer precisely?"
+            return "Please share the chapter, section, or key term you want me to focus on."
+        return "Can you clarify your question with a bit more detail?"
