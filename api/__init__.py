@@ -13,8 +13,10 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 import logging
 import os
+import atexit
 
-from database.app_store import init_db
+from database.app_store import init_db, upsert_admin_user
+from core.utils.logging_utils import shutdown_logging
 
 
 # ============================================================
@@ -24,6 +26,11 @@ from database.app_store import init_db
 def create_app():
 
     app = Flask(__name__)
+
+    # --------------------------------------------------------
+    # Register Shutdown Handler for Graceful Logging Cleanup
+    # --------------------------------------------------------
+    atexit.register(shutdown_logging)
 
     # --------------------------------------------------------
     # Enable CORS
@@ -48,6 +55,7 @@ def create_app():
     # Initialize DB
     # --------------------------------------------------------
     init_db()
+    _bootstrap_admin_user()
 
     # --------------------------------------------------------
     # Register Routes
@@ -80,3 +88,30 @@ def create_app():
         })
 
     return app
+
+
+def _bootstrap_admin_user() -> None:
+    username = (os.getenv("ADMIN_NAME") or "").strip()
+    email = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+    password = os.getenv("ADMIN_PASSWORD") or ""
+
+    if not any([username, email, password]):
+        return
+
+    if not username or not email or not password:
+        logging.warning(
+            "Skipping admin bootstrap: set ADMIN_NAME, ADMIN_EMAIL, and ADMIN_PASSWORD together."
+        )
+        return
+
+    try:
+        from api.auth.password_utils import hash_password
+
+        user = upsert_admin_user(
+            username=username,
+            email=email,
+            password_hash=hash_password(password),
+        )
+        logging.info("Admin bootstrap complete for %s", user.get("email"))
+    except Exception:
+        logging.exception("Admin bootstrap failed.")

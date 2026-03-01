@@ -110,3 +110,51 @@ class DocumentRegistry:
         except Exception:
             logger.exception("Failed fetching documents")
             raise
+
+    # =====================================================
+    # FETCH BY DOC ID
+    # =====================================================
+
+    def fetch_by_doc_id(self, doc_id):
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM documents WHERE doc_id = ? LIMIT 1",
+                    (doc_id,)
+                )
+                row = cursor.fetchone()
+
+            return row
+
+        except Exception:
+            logger.exception(f"Failed fetching document by id: {doc_id}")
+            raise
+
+    # =====================================================
+    # DELETE DOCUMENT
+    # =====================================================
+
+    def delete(self, doc_id):
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM documents WHERE doc_id = ?",
+                    (doc_id,)
+                )
+                deleted = cursor.rowcount > 0
+                conn.commit()
+
+            if deleted:
+                logger.info(f"Deleted document from registry: {doc_id}")
+            else:
+                logger.warning(f"Document not found in registry: {doc_id}")
+
+            return deleted
+
+        except Exception:
+            logger.exception(f"Failed deleting document from registry: {doc_id}")
+            raise

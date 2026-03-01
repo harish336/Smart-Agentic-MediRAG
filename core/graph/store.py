@@ -265,8 +265,9 @@ class GraphStore:
         """
 
         query = f"""
-        MATCH (d:{DOCUMENT} {{{DOC_ID}: $doc_id}})
-        DETACH DELETE d
+        MATCH (n)
+        WHERE n.{DOC_ID} = $doc_id
+        DETACH DELETE n
         """
 
         with self.driver.session(database=self.database) as session:

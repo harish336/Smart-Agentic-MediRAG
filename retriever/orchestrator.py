@@ -189,10 +189,18 @@ class RetrieverOrchestrator:
             )
 
             logger.info(
-                "Hybrid breakdown | vector=%d graph_keyword=%d graph_expanded=%d total=%d",
+                "Hybrid breakdown | vector=%d graph_keyword=%d graph_expanded=%d total_before_dedup=%d",
                 len(vector_results),
                 len(graph_keyword),
                 len(graph_expanded),
+                len(merged)
+            )
+
+            # Deduplicate immediately before returning to prevent downstream duplicates
+            merged = self._deduplicate(merged)
+            
+            logger.info(
+                "Hybrid after deduplication: %d",
                 len(merged)
             )
 
@@ -248,20 +256,44 @@ class RetrieverOrchestrator:
     # =====================================================
 
     def _deduplicate(self, results: List[Dict]) -> List[Dict]:
-
+        """
+        Deduplicate results using (doc_id, chunk_id) tuple as unique key.
+        Keeps the result with the highest score when duplicates are found.
+        """
         best = {}
 
         for r in results:
+            if not isinstance(r, dict):
+                continue
+                
+            doc_id = r.get("doc_id")
+            chunk_id = r.get("chunk_id")
+            
+            if not doc_id or not chunk_id:
+                # Skip results without proper identification
+                continue
 
-            unique_key = (r.get("doc_id"), r.get("chunk_id"))
+            unique_key = (doc_id, chunk_id)
 
             if unique_key not in best:
                 best[unique_key] = r
             else:
-                if r.get("score", 0) > best[unique_key].get("score", 0):
-                    best[unique_key] = r
+                try:
+                    current_score = float(r.get("score", 0))
+                    existing_score = float(best[unique_key].get("score", 0))
+                    if current_score > existing_score:
+                        best[unique_key] = r
+                except (TypeError, ValueError):
+                    # If score comparison fails, keep the existing one
+                    pass
 
-        return list(best.values())
+        deduped = list(best.values())
+        
+        logger.debug(
+            f"Orchestrator deduplication: {len(results)} results → {len(deduped)} unique results"
+        )
+        
+        return deduped
 
     # =====================================================
     # LOGGING HELPERS

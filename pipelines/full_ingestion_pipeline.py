@@ -2,8 +2,6 @@
 SMART MEDIRAG — FULL INGESTION PIPELINE
 """
 
-import uuid
-
 # -------------------------------
 # CORE MODULES
 # -------------------------------
@@ -39,16 +37,21 @@ class FullIngestionPipeline:
         logger.info("=" * 100)
 
         self.pdf_path = pdf_path
-        self.doc_id = f"doc_{uuid.uuid4().hex[:8]}"
 
         try:
             self.cleaner = TextCleaner()
             self.vector_orch = VectorOrchestrator(self.pdf_path)
+            self.doc_id = self.vector_orch.document_id
             self.graph_orch = GraphOrchestrator(self.vector_orch.document_id)
             self.config = get_system_config()
         except Exception:
             logger.exception("Pipeline initialization failed")
             raise
+
+    def _batch_iterator(self, iterable, batch_size=100):
+        """Yields successive n-sized chunks from a list."""
+        for i in range(0, len(iterable), batch_size):
+            yield iterable[i:i + batch_size]
 
     # =====================================================
     # STEP 1 — TOC + OFFSET
@@ -122,9 +125,10 @@ class FullIngestionPipeline:
         logger.info("[PIPELINE] STEP 4 — VECTOR STORAGE")
 
         try:
-            self.vector_orch.ingest(
-                chunks=chunks
-            )
+            # Process 100 chunks at a time instead of thousands
+            for i, batch in enumerate(self._batch_iterator(chunks, batch_size=100)):
+                logger.info(f"Ingesting vector batch {i+1}...")
+                self.vector_orch.ingest(chunks=batch)
         except Exception:
             logger.exception("Vector storage failed")
             raise
@@ -138,19 +142,24 @@ class FullIngestionPipeline:
         logger.info("[PIPELINE] STEP 5 — GRAPH STORAGE")
 
         try:
+            chunk_payloads = []
             for chunk in chunks:
+                chunk_payloads.append(
+                    {
+                        "doc_id": self.doc_id,
+                        "chapter": chunk.get("chapter"),
+                        "subheading": chunk.get("subheading"),
+                        "chunk_id": chunk["chunk_id"],
+                        "text": chunk["text"],
+                        "page_label": chunk.get("page_label"),
+                        "page_physical": chunk.get("page_physical"),
+                    }
+                )
 
-                chunk_payload = {
-                    "doc_id": self.doc_id,
-                    "chapter": chunk.get("chapter"),
-                    "subheading": chunk.get("subheading"),
-                    "chunk_id": chunk["chunk_id"],
-                    "text": chunk["text"],
-                    "page_label": chunk.get("page_label"),
-                    "page_physical": chunk.get("page_physical")
-                }
-
-                self.graph_orch.ingest_chunks([chunk_payload])
+            # Process 100 graph nodes at a time
+            for i, batch in enumerate(self._batch_iterator(chunk_payloads, batch_size=100)):
+                logger.info(f"Ingesting graph batch {i+1}...")
+                self.graph_orch.ingest_chunks(batch)
 
         except Exception:
             logger.exception("Graph storage failed")

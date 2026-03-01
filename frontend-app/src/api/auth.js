@@ -23,6 +23,9 @@ export const loginUser = async (credentials) => {
     });
     return response.data;
   } catch (error) {
+    if (error.response?.status === 401) {
+      throw { error: "Invalid credentials" };
+    }
     throw error.response?.data || { error: "Login failed" };
   }
 };

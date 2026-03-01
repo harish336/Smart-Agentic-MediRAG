@@ -1,16 +1,39 @@
-# React + Vite
+# Smart Medirag Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite + Tailwind frontend for Smart Medirag.
 
-Currently, two official plugins are available:
+## Prerequisites
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- Node.js 18+
+- npm 9+
+- Backend API running at `http://localhost:5000`
 
-## React Compiler
+## Run locally
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```bash
+cd frontend-app
+npm install
+npm run dev
+```
 
-## Expanding the ESLint configuration
+Dev server runs at `http://localhost:5173`.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Build for production
+
+```bash
+cd frontend-app
+npm run build
+npm run preview
+```
+
+## Admin routes
+
+- Admin login: `/#/admin/login`
+- Admin ingestion console: `/#/admin/ingest`
+
+## UI updates (March 1, 2026)
+
+- Indexed Documents panel now uses responsive fixed heights to avoid overflow/collapse across screen sizes.
+- Improved scroll container sizing with `min-h-0` so the document table stays stable in flex layouts.
+- Added smoother transitions for panel state changes and verification-result reveal.
+- Improved table sizing for the `Doc ID` column and cleaned date-cell alignment.

@@ -154,19 +154,44 @@ class BaseRetriever(ABC):
     # =====================================================
 
     def deduplicate(self, results: List[Dict]) -> List[Dict]:
-
+        """
+        Deduplicate results using (doc_id, chunk_id) tuple as unique key.
+        Keeps the result with the highest score when duplicates are found.
+        """
         best = {}
 
         for r in results:
-            unique_key = (r["doc_id"], r["chunk_id"])
+            if not isinstance(r, dict):
+                continue
+                
+            doc_id = r.get("doc_id")
+            chunk_id = r.get("chunk_id")
+            
+            if not doc_id or not chunk_id:
+                # Skip results without proper identification
+                continue
+                
+            unique_key = (doc_id, chunk_id)
 
             if unique_key not in best:
                 best[unique_key] = r
             else:
-                if r["score"] > best[unique_key]["score"]:
-                    best[unique_key] = r
+                try:
+                    current_score = float(r.get("score", 0))
+                    existing_score = float(best[unique_key].get("score", 0))
+                    if current_score > existing_score:
+                        best[unique_key] = r
+                except (TypeError, ValueError):
+                    # If score comparison fails, keep the existing one
+                    pass
 
-        return list(best.values())
+        deduped = list(best.values())
+        
+        logger.debug(
+            f"Deduplication: {len(results)} results → {len(deduped)} unique results"
+        )
+        
+        return deduped
 
     # =====================================================
     # CACHE KEY (Optional future use)
