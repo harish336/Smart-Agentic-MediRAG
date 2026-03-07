@@ -67,6 +67,9 @@ class GraphRetriever(BaseRetriever):
             doc_id = None
             if filters and "doc_id" in filters:
                 doc_id = filters["doc_id"]
+            owner_user_id = None
+            if filters and "owner_user_id" in filters:
+                owner_user_id = str(filters["owner_user_id"]).strip() or None
 
             # 1️⃣ Extract concepts
             concepts = self._extract_concepts(query)
@@ -84,13 +87,15 @@ class GraphRetriever(BaseRetriever):
                 doc_id=doc_id,
                 concepts=concepts,
                 emotion=query_emotion,
-                top_k=top_k
+                top_k=top_k,
+                owner_user_id=owner_user_id,
             )
 
             # 4️⃣ Multi-hop expansion
             expanded_results = self._expand_multihop(
                 primary_results,
-                doc_id
+                doc_id,
+                owner_user_id,
             )
 
             combined = self._deduplicate(primary_results + expanded_results)
@@ -162,7 +167,8 @@ class GraphRetriever(BaseRetriever):
     doc_id: Optional[str],
     concepts: List[str],
     emotion: Optional[str],
-    top_k: int
+    top_k: int,
+    owner_user_id: Optional[str],
 ) -> List[Dict]:
 
         fulltext_query = self._build_fulltext_query(concepts)
@@ -173,15 +179,19 @@ class GraphRetriever(BaseRetriever):
                 query=fulltext_query,
                 limit=top_k * 3,
                 doc_id=doc_id,
-                emotion=emotion
+                emotion=emotion,
+                owner_user_id=owner_user_id,
             )
 
         if not records:
             cypher = """
             MATCH (c:Chunk)
+            OPTIONAL MATCH (s:Subheading)-[:HAS_CHUNK]->(c)
+            OPTIONAL MATCH (ch:Chapter)-[:HAS_SUBHEADING]->(s)
             OPTIONAL MATCH (c)-[:HAS_EMOTION]->(e:Emotion)
             WHERE
                 ($doc_id IS NULL OR c.doc_id = $doc_id)
+                AND ($owner_user_id IS NULL OR c.owner_user_id = $owner_user_id OR c.owner_user_id IS NULL)
                 AND any(term IN $concepts WHERE toLower(c.text) CONTAINS term)
                 AND ($emotion IS NULL OR e.name = $emotion)
 
@@ -189,6 +199,11 @@ class GraphRetriever(BaseRetriever):
                 c.chunk_id AS chunk_id,
                 c.doc_id AS doc_id,
                 c.text AS text,
+                c.page_type AS page_type,
+                c.page_label AS page_label,
+                c.page_physical AS page_physical,
+                ch.name AS chapter,
+                s.name AS subheading,
                 e.name AS emotion
             LIMIT $limit
             """
@@ -199,7 +214,8 @@ class GraphRetriever(BaseRetriever):
                     "doc_id": doc_id,
                     "concepts": concepts,
                     "emotion": emotion,
-                    "limit": top_k
+                    "limit": top_k,
+                    "owner_user_id": owner_user_id,
                 }
             )
 
@@ -220,7 +236,12 @@ class GraphRetriever(BaseRetriever):
                 "graph_score": 1.0,
                 "source": "graph_fulltext" if r.get("score") is not None else "graph_keyword",
                 "metadata": {
-                    "emotion": r.get("emotion")
+                    "emotion": r.get("emotion"),
+                    "chapter": r.get("chapter"),
+                    "subheading": r.get("subheading"),
+                    "page_type": r.get("page_type"),
+                    "page_label": r.get("page_label"),
+                    "page_physical": r.get("page_physical"),
                 }
             })
 
@@ -233,7 +254,8 @@ class GraphRetriever(BaseRetriever):
     def _expand_multihop(
         self,
         primary_results: List[Dict],
-        doc_id: str
+        doc_id: str,
+        owner_user_id: Optional[str],
     ) -> List[Dict]:
 
         expanded = []
@@ -246,17 +268,22 @@ class GraphRetriever(BaseRetriever):
         UNWIND $seed_ids AS seed_id
         MATCH (c:Chunk {{chunk_id: seed_id}})
         WHERE ($doc_id IS NULL OR c.doc_id = $doc_id)
+          AND ($owner_user_id IS NULL OR c.owner_user_id = $owner_user_id OR c.owner_user_id IS NULL)
 
         OPTIONAL MATCH (c)-[:NEXT*1..{self.max_hops}]-(neighbor:Chunk)
 
         WHERE neighbor IS NOT NULL
         AND neighbor.chunk_id <> seed_id
         AND ($doc_id IS NULL OR neighbor.doc_id = $doc_id)
+        AND ($owner_user_id IS NULL OR neighbor.owner_user_id = $owner_user_id OR neighbor.owner_user_id IS NULL)
 
         RETURN DISTINCT
             neighbor.chunk_id AS chunk_id,
             neighbor.doc_id AS doc_id,
-            neighbor.text AS text
+            neighbor.text AS text,
+            neighbor.page_type AS page_type,
+            neighbor.page_label AS page_label,
+            neighbor.page_physical AS page_physical
         LIMIT $limit
         """
 
@@ -265,7 +292,8 @@ class GraphRetriever(BaseRetriever):
             {
                 "seed_ids": seed_ids,
                 "doc_id": doc_id,
-                "limit": self.max_expanded
+                "limit": self.max_expanded,
+                "owner_user_id": owner_user_id,
             }
         )
 
@@ -276,7 +304,11 @@ class GraphRetriever(BaseRetriever):
                 "text": r.get("text"),
                 "score": 0.7,
                 "source": "graph_multihop",
-                "metadata": {}
+                "metadata": {
+                    "page_type": r.get("page_type"),
+                    "page_label": r.get("page_label"),
+                    "page_physical": r.get("page_physical"),
+                }
             })
 
         return expanded

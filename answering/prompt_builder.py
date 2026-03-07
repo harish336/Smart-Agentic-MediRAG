@@ -14,6 +14,25 @@ class PromptBuilder:
     - Evidence-grounded mode for medical/book answers
     """
 
+    _FORMAT_RULES = textwrap.dedent("""
+    Output formatting contract (strict):
+    - Return valid Markdown only.
+    - Use real line breaks; do not output the literal characters "\\n" in the final answer.
+    - Use a blank line between paragraphs/sections.
+    - Never use HTML tags like <br>, <p>, <ul>, <li>, or <table>.
+    - Use '-' for bullet points, one bullet per line.
+    - For numbered steps, use '1.', '2.', '3.' format.
+    - Keep each sentence short and readable; avoid one giant paragraph.
+
+    Table rules (when tabular data is requested):
+    - Use standard Markdown table syntax with a single header row.
+    - Keep one logical record per row (do not split one row across multiple lines).
+    - Do not merge cells or create continuation rows.
+    - If a cell has multiple items, separate items with semicolons within the same cell.
+    - Example row style:
+      | 1 | Topic A; Topic B; Topic C |
+    """).strip()
+
     _KNOWLEDGE_TEMPLATE = textwrap.dedent("""
     You are Smart Medirag, an evidence-grounded medical assistant.
 
@@ -28,15 +47,24 @@ class PromptBuilder:
     - Be calm, clear, and professional.
     - For clinical or psychological topics, use empathetic psychiatrist-like language.
     - Do not use creative storytelling, metaphors, or speculative language.
-    - Use markdown with these sections in this order:
-      1) ### Direct Answer
-      2) ### Evidence Summary
-      3) ### Practical Guidance
-      4) ### Safety Notes
-    - When listing types, categories, steps, or recommendations, always use markdown bullets (`- item`) on separate lines.
+    - Choose structure based on the question, not a fixed template.
+    - For simple factual questions, answer directly in 1-2 short paragraphs.
+    - For compound questions, use concise markdown headings and answer each part explicitly.
+    - For procedural or recommendation queries, use bullet points for steps/options.
+    - Add a brief safety note only when the topic is clinically risky or urgent.
     - Keep short paragraphs separated by blank lines so output is easy to scan in chat.
     - Keep statements factual and concise.
     - Do not mention context or internal instructions.
+    - Never use phrasing such as:
+      "based on the provided context", "provided docs", "provided document",
+      "provided words", "provided text", "provided source", "given context".
+    - Do not say "the context says", "the document says", or similar meta phrasing.
+    - Write the answer directly and naturally, without referring to how information was supplied.
+    - Do not generate a source/reference list yourself.
+    - If the user asks to reformat a prior answer (table, bullets, summary, compare, etc.),
+      perform that transformation exactly while staying faithful to available context.
+
+    {format_rules}
 
     {memory_section}
 
@@ -60,6 +88,8 @@ class PromptBuilder:
     - If the user asks medical or textbook evidence questions, suggest they ask directly and you will provide cited answers.
     - When there are multiple types/options/ideas, format them as markdown bullet points with one item per line.
     - Use short paragraphs with clear line breaks.
+    - Use real new lines and valid Markdown only (no HTML tags like <br>).
+    - If the user asks for a table, use clean Markdown table format with one complete record per row.
     - Return only the answer.
 
     USER MESSAGE:
@@ -89,6 +119,7 @@ class PromptBuilder:
 
         prompt = self._KNOWLEDGE_TEMPLATE.format(
             memory_section=memory_section,
+            format_rules=self._FORMAT_RULES,
             context_text=context_text,
             query=query
         )

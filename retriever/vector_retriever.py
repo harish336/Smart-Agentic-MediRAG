@@ -36,6 +36,7 @@ class VectorRetriever(BaseRetriever):
         try:
             self.embedder = VectorEmbedder()
             self.store = ChromaStore()
+            self.user_stores = {}
 
             db_config = get_database_config()
             vector_cfg = db_config.get("vector_db", {})
@@ -71,17 +72,27 @@ class VectorRetriever(BaseRetriever):
             # Embed query
             query_embedding = self.embedder.embed_one(query)
 
-            # Query vector store
-            raw_results = self.store.query(
-                query_embedding=query_embedding,
-                top_k=top_k
-            )
+            owner_user_id = None
+            if filters and filters.get("owner_user_id"):
+                owner_user_id = str(filters.get("owner_user_id")).strip()
 
-            if not raw_results:
+            # Query base/global store first
+            all_formatted = []
+            raw_results = self.store.query(query_embedding=query_embedding, top_k=top_k)
+            if raw_results:
+                all_formatted.extend(self._format_results(raw_results))
+
+            # Query user-private store when owner filter is present.
+            if owner_user_id:
+                user_store = self._get_user_store(owner_user_id)
+                raw_user_results = user_store.query(query_embedding=query_embedding, top_k=top_k)
+                if raw_user_results:
+                    all_formatted.extend(self._format_results(raw_user_results))
+
+            if not all_formatted:
                 return []
 
-            # Format results
-            formatted = self._format_results(raw_results)
+            formatted = all_formatted
 
             # Apply similarity threshold
             if self.min_score_threshold > 0:
@@ -92,7 +103,9 @@ class VectorRetriever(BaseRetriever):
 
             # Apply metadata filtering
             if filters:
-                formatted = self._apply_filters(formatted, filters)
+                filtered_copy = {k: v for k, v in filters.items() if k != "owner_user_id"}
+                if filtered_copy:
+                    formatted = self._apply_filters(formatted, filtered_copy)
 
             # IMPORTANT:
             # Do NOT deduplicate or validate here.
@@ -107,6 +120,14 @@ class VectorRetriever(BaseRetriever):
                 raise
 
             return []
+
+    def _get_user_store(self, owner_user_id: str) -> ChromaStore:
+        cached = self.user_stores.get(owner_user_id)
+        if cached is not None:
+            return cached
+        store = ChromaStore(collection_name=f"smart_chunks_user_{owner_user_id}")
+        self.user_stores[owner_user_id] = store
+        return store
 
     # =====================================================
     # FORMAT CHROMA RESULTS
@@ -138,6 +159,7 @@ class VectorRetriever(BaseRetriever):
                 "metadata": {
                     "chapter": metadata.get("chapter"),
                     "subheading": metadata.get("subheading"),
+                    "page_type": metadata.get("page_type"),
                     "page_label": metadata.get("page_label"),
                     "page_physical": metadata.get("page_physical")
                 }

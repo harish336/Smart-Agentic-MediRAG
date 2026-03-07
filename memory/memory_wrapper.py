@@ -9,6 +9,7 @@ import requests
 from memory.memory_service import MemoryService
 from answering.answering_agent import AnsweringAgent
 from core.utils.logging_utils import get_component_logger
+from database.app_store import get_thread_messages
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -42,7 +43,9 @@ class MemoryWrappedAnsweringAgent:
         self,
         user_id: str,
         query: str,
-        thread_id: Optional[str] = None
+        thread_id: Optional[str] = None,
+        context_prefix: str = "",
+        retrieval_filters: Optional[dict] = None,
     ) -> Dict:
 
         if not user_id:
@@ -71,10 +74,14 @@ class MemoryWrappedAnsweringAgent:
 
             if query_type == "transformation":
 
-                last_answer = self.memory.get_last_assistant_response(
-                    user_id=user_id,
-                    thread_id=thread_id
-                )
+                # Prefer persisted thread history so transformations work even after
+                # regenerate/branch actions or app restarts.
+                last_answer = self._get_last_assistant_from_store(thread_id=thread_id)
+                if not last_answer:
+                    last_answer = self.memory.get_last_assistant_response(
+                        user_id=user_id,
+                        thread_id=thread_id
+                    )
 
                 if not last_answer:
                     return {
@@ -96,7 +103,8 @@ Instruction:
                 enriched_query = self._inject_memory(
                     query=query,
                     user_id=user_id,
-                    thread_id=thread_id
+                    thread_id=thread_id,
+                    context_prefix=context_prefix,
                 )
 
             # --------------------------------------------
@@ -105,7 +113,8 @@ Instruction:
 
             result = self.agent.answer(
                 query=enriched_query,       # used for prompt
-                retrieval_query=query       # ONLY clean user question
+                retrieval_query=query,      # ONLY clean user question
+                retrieval_filters=retrieval_filters,
             )
 
             # --------------------------------------------
@@ -136,6 +145,19 @@ Instruction:
             logger.exception("Error inside memory wrapper")
             return {"response": "", "citations": []}
 
+    def _get_last_assistant_from_store(self, thread_id: str) -> str:
+        try:
+            rows = get_thread_messages(thread_id)
+            for message in reversed(rows or []):
+                if (message.get("role") or "").strip().lower() != "assistant":
+                    continue
+                content = (message.get("content") or "").strip()
+                if content:
+                    return content
+        except Exception:
+            logger.exception("Failed reading persisted thread messages for transformation")
+        return ""
+
     # ============================================================
     # THREAD MANAGEMENT
     # ============================================================
@@ -162,9 +184,18 @@ Instruction:
     # MEMORY INJECTION (For Knowledge Queries)
     # ============================================================
 
-    def _inject_memory(self, query: str, user_id: str, thread_id: str) -> str:
+    def _inject_memory(
+        self,
+        query: str,
+        user_id: str,
+        thread_id: str,
+        context_prefix: str = "",
+    ) -> str:
 
         memory_block = []
+        prefix = (context_prefix or "").strip()
+        if prefix:
+            memory_block.append(prefix)
 
         ltm_context = self.memory.get_ltm(user_id)
         if ltm_context:

@@ -215,7 +215,8 @@ class TOCOrchestrator:
                 "toc_type": self.toc_type,
                 "toc_page": self.toc_page + 1,
                 "toc_page_index": self.toc_page,
-                "toc_entries": self.toc_entries
+                "toc_entries": self.toc_entries,
+                "offset": self.offset,
             }
 
             with open("toc_final.json", "w", encoding="utf-8") as f:

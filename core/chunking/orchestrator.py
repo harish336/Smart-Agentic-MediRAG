@@ -1,5 +1,5 @@
 """
-Smart Medirag — Chunking Orchestrator
+Smart Medirag - Chunking Orchestrator
 
 Connects:
 - Style detection
@@ -9,11 +9,13 @@ Connects:
 """
 
 import uuid
-from core.chunking.style_detector import StyleDetector
+
+from config.system_loader import get_system_config
 from core.chunking.accumulator import TextAccumulator
 from core.chunking.overlapper import ChunkOverlapper
+from core.chunking.style_detector import StyleDetector
+from core.chunking.toc_metadata import TOCMetadataEnricher
 from core.chunking.validator import PipelineValidator
-from config.system_loader import get_system_config
 
 
 class ChunkOrchestrator:
@@ -24,7 +26,8 @@ class ChunkOrchestrator:
         self.toc_data = toc_data
 
         self.style_detector = StyleDetector(pdf_path)
-        self.accumulator = TextAccumulator()
+        self.accumulator = TextAccumulator(toc_data=toc_data)
+        self.toc_enricher = TOCMetadataEnricher(toc_data=toc_data)
         self.overlapper = ChunkOverlapper()
         self.validator = PipelineValidator()
 
@@ -39,11 +42,11 @@ class ChunkOrchestrator:
     def run(self):
 
         print("\n" + "=" * 70)
-        print("SMART MEDIRAG — CHUNKING STARTED")
+        print("SMART MEDIRAG - CHUNKING STARTED")
         print("=" * 70)
 
         # -----------------------------------------
-        # STEP 1 — Detect styles
+        # STEP 1 - Detect styles
         # -----------------------------------------
 
         styled_blocks = self.style_detector.run()
@@ -51,7 +54,7 @@ class ChunkOrchestrator:
         print(f"[CHUNK ORCH] Styled blocks: {len(styled_blocks)}")
 
         # -----------------------------------------
-        # STEP 2 — Accumulate hierarchical chunks
+        # STEP 2 - Accumulate hierarchical chunks
         # -----------------------------------------
 
         chunks = self.accumulator.run(styled_blocks)
@@ -59,16 +62,24 @@ class ChunkOrchestrator:
         print(f"[CHUNK ORCH] Accumulated chunks: {len(chunks)}")
 
         # -----------------------------------------
-        # STEP 3 — Apply overlap
+        # STEP 3 - Apply TOC metadata timeline
         # -----------------------------------------
 
-        if self.config["overlap"]["enabled"]:
+        chunks = self.toc_enricher.apply(chunks)
+
+        print(f"[CHUNK ORCH] After TOC metadata: {len(chunks)}")
+
+        # -----------------------------------------
+        # STEP 4 - Apply overlap
+        # -----------------------------------------
+
+        if self.config["overlap"].get("enabled", True):
             chunks = self.overlapper.apply(chunks)
 
         print(f"[CHUNK ORCH] After overlap: {len(chunks)}")
 
         # -----------------------------------------
-        # STEP 4 — Validate chunks
+        # STEP 5 - Validate chunks
         # -----------------------------------------
 
         valid_chunks = []
@@ -82,7 +93,7 @@ class ChunkOrchestrator:
         print(f"[CHUNK ORCH] Valid chunks: {len(valid_chunks)}")
 
         print("=" * 70)
-        print("SMART MEDIRAG — CHUNKING COMPLETED")
+        print("SMART MEDIRAG - CHUNKING COMPLETED")
         print("=" * 70 + "\n")
 
         return valid_chunks

@@ -24,7 +24,13 @@ class GraphOrchestrator:
     # INIT
     # =====================================================
 
-    def __init__(self, document_id: str, max_workers: int = 8, batch_size: int = 500):
+    def __init__(
+        self,
+        document_id: str,
+        max_workers: int = 8,
+        batch_size: int = 500,
+        owner_user_id: str | None = None,
+    ):
 
         logger.info("\n" + "=" * 80)
         logger.info("SMART MEDIRAG — GRAPH ORCHESTRATOR (OPTIMIZED)")
@@ -32,6 +38,7 @@ class GraphOrchestrator:
 
         try:
             self.document_id = document_id
+            self.owner_user_id = (owner_user_id or "").strip() or None
             self.max_workers = max_workers
             self.batch_size = batch_size
 
@@ -145,12 +152,14 @@ class GraphOrchestrator:
                     batch = valid_chunks[i:i + self.batch_size]
                     self.store.batch_ingest(
                         doc_id=self.document_id,
-                        chunks=batch
+                        chunks=batch,
+                        owner_user_id=self.owner_user_id,
                     )
             else:
                 self.store.batch_ingest(
                     doc_id=self.document_id,
-                    chunks=valid_chunks
+                    chunks=valid_chunks,
+                    owner_user_id=self.owner_user_id,
                 )
 
             logger.info("[STEP 3] Batch ingestion completed\n")

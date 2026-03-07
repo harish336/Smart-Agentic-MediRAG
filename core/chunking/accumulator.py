@@ -3,24 +3,16 @@ Text Accumulator & Chunker
 
 Responsibilities:
 - Accumulate text based on heading / subheading / body flow
-- Maintain page numbers
-- Apply max chunk size
-- Apply pre & post overlap
-- Sort by page number
-- Standalone runnable for verification
-
-This file DOES NOT depend on vector DB or Neo4j.
+- Maintain physical page range
+- Map logical page labels from TOC offset when available
+- Apply max chunk size from config
+- Sort by physical page
 """
 
-import sys
-import json
-from pprint import pprint
-from typing import List, Dict
+import re
+from typing import Dict, List, Optional
 
-# ---------------- CONFIG ----------------
-MAX_CHUNK_SIZE = 1500
-PRE_OVERLAP = 300
-POST_OVERLAP = 300
+from config.system_loader import get_system_config
 
 
 class TextAccumulator:
@@ -29,13 +21,24 @@ class TextAccumulator:
     # INITIALIZATION
     # =====================================================
 
-    def __init__(self):
+    def __init__(self, toc_data: Optional[Dict] = None):
         print("[TEXT ACCUMULATOR] Initialized")
+
+        self.config = get_system_config()
+        chunk_size_cfg = self.config.get("chunking", {}).get("size", {})
+        self.max_chunk_size = int(chunk_size_cfg.get("max_chars", 1500))
+
+        self.toc_data = toc_data or {}
+        self.offset = self._parse_offset(self.toc_data.get("offset"))
+        self.toc_anchors = self._build_toc_anchors(self.toc_data.get("toc_entries") or [])
 
         self.current_heading = None
         self.current_subheading = None
         self.buffer = ""
+        self.buffer_page_type = None
         self.start_page = None
+        self.end_page = None
+        self.current_page_type = None
         self.chunks = []
 
     # =====================================================
@@ -52,7 +55,10 @@ class TextAccumulator:
         self.current_heading = None
         self.current_subheading = None
         self.buffer = ""
+        self.buffer_page_type = None
         self.start_page = None
+        self.end_page = None
+        self.current_page_type = None
         self.chunks = []
 
         for unit in styled_blocks:
@@ -75,9 +81,14 @@ class TextAccumulator:
         unit_type = unit.get("type")
         text = unit.get("text", "").strip()
         page = unit.get("page")
+        page_type = unit.get("page_type") or "content"
 
         if not text:
             return
+
+        # Do not mix structurally different page regions in one chunk.
+        if self.current_page_type and page_type != self.current_page_type:
+            self.flush()
 
         # New heading resets everything
         if unit_type == "heading":
@@ -85,16 +96,22 @@ class TextAccumulator:
             self.flush()
             self.current_heading = text
             self.current_subheading = None
-            self.start_page = page
-            self.buffer = text + "\n"
+            self.start_page = None
+            self.end_page = None
+            self.current_page_type = page_type
+            self.buffer = ""
+            self.buffer_page_type = page_type
 
         # New subheading resets body accumulation
         elif unit_type == "subheading":
 
             self.flush()
             self.current_subheading = text
-            self.start_page = page
-            self.buffer = self._compose_prefix() + text + "\n"
+            self.start_page = None
+            self.end_page = None
+            self.current_page_type = page_type
+            self.buffer = ""
+            self.buffer_page_type = page_type
 
         # Body text accumulates
         else:
@@ -102,10 +119,24 @@ class TextAccumulator:
             if self.start_page is None:
                 self.start_page = page
 
+            self.end_page = page
+            self.current_page_type = page_type
+            if self.buffer_page_type is None:
+                self.buffer_page_type = page_type
+
+            if not self.buffer:
+                prefix = self._compose_prefix()
+                if prefix:
+                    self.buffer += prefix + "\n"
+
             self.buffer += text + "\n"
 
+        # Ensure end_page is set for heading/subheading-only chunks
+        if self.end_page is None and page is not None:
+            self.end_page = page
+
         # Check size
-        if len(self.buffer) >= MAX_CHUNK_SIZE:
+        if len(self.buffer) >= self.max_chunk_size:
             self.flush()
 
     # =====================================================
@@ -117,47 +148,35 @@ class TextAccumulator:
         if not self.buffer.strip():
             return
 
-        chunk = {
-            "chapter": self.current_heading,
-            "subheading": self.current_subheading,
-            "page_physical": self.start_page,
-            "page_label": None,  # Can be injected later if offset applied
-            "text": self.buffer.strip()
-        }
+        text = self.buffer.strip()
+        page_physical = self.start_page
+        page_label = self._physical_to_label(page_physical)
+        toc_chapter, toc_subheading = self._toc_context_for_label(page_label)
+        chapter = self.current_heading or toc_chapter
+        subheading = self.current_subheading or toc_subheading
+        page_type = self.buffer_page_type or self.current_page_type or "content"
 
-        self.chunks.append(chunk)
+        parts = self._split_text_for_chunks(text)
+        for part in parts:
+            chunk = {
+                "chapter": chapter,
+                "subheading": subheading,
+                "page_type": page_type,
+                "page_physical": page_physical,
+                "page_physical_end": self.end_page,
+                "page_label": page_label,
+                "text": part,
+            }
+            self.chunks.append(chunk)
 
         self.buffer = ""
+        self.buffer_page_type = None
+        self.start_page = None
+        self.end_page = None
+        self.current_page_type = None
 
     # =====================================================
-    # STEP 3: Apply overlap
-    # =====================================================
-
-    def apply_overlap(self):
-
-        overlapped = []
-
-        for i, chunk in enumerate(self.chunks):
-
-            text = chunk["text"]
-
-            if i > 0:
-                prev = self.chunks[i - 1]["text"]
-                text = prev[-PRE_OVERLAP:] + "\n" + text
-
-            if i < len(self.chunks) - 1:
-                nxt = self.chunks[i + 1]["text"]
-                text = text + "\n" + nxt[:POST_OVERLAP]
-
-            new_chunk = dict(chunk)
-            new_chunk["text"] = text
-
-            overlapped.append(new_chunk)
-
-        self.chunks = overlapped
-
-    # =====================================================
-    # STEP 4: Finalize
+    # STEP 3: Finalize
     # =====================================================
 
     def finalize(self):
@@ -167,8 +186,6 @@ class TextAccumulator:
         # Sort by physical page
         self.chunks.sort(key=lambda x: x["page_physical"] or 0)
 
-        self.apply_overlap()
-
         return self.chunks
 
     # =====================================================
@@ -177,51 +194,166 @@ class TextAccumulator:
 
     def _compose_prefix(self):
 
-        prefix = ""
+        parts = []
 
         if self.current_heading:
-            prefix += self.current_heading + "\n"
+            parts.append(self.current_heading)
 
-        return prefix
+        if self.current_subheading:
+            parts.append(self.current_subheading)
 
+        return "\n".join(parts).strip()
 
-# ============================================================
-# STANDALONE RUNNER
-# ============================================================
+    def _split_text_for_chunks(self, text: str) -> List[str]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
 
-def main():
+        if len(cleaned) <= self.max_chunk_size:
+            return [cleaned]
 
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python accumulator.py <input_json>")
-        sys.exit(1)
+        parts = []
+        remaining = cleaned
 
-    input_file = sys.argv[1]
+        while len(remaining) > self.max_chunk_size:
+            cut = self._find_split_index(remaining, self.max_chunk_size)
+            piece = remaining[:cut].strip()
+            if piece:
+                parts.append(piece)
+            remaining = remaining[cut:].strip()
 
-    print("=" * 100)
-    print("TEXT ACCUMULATOR (STANDALONE)")
-    print("=" * 100)
+        if remaining:
+            parts.append(remaining)
 
-    try:
-        units = json.load(open(input_file, "r", encoding="utf-8"))
-    except Exception as e:
-        print(f"[ERROR] Failed to load input JSON: {e}")
-        sys.exit(1)
+        return parts
 
-    accumulator = TextAccumulator()
-    chunks = accumulator.run(units)
+    def _find_split_index(self, text: str, preferred: int) -> int:
+        if len(text) <= preferred:
+            return len(text)
 
-    pprint(chunks, width=130)
+        floor = max(int(preferred * 0.65), 120)
+        window = text[:preferred + 1]
 
-    json.dump(
-        chunks,
-        open("chunks_accumulated.json", "w", encoding="utf-8"),
-        indent=2
-    )
+        sentence_cut = max(window.rfind(". "), window.rfind("? "), window.rfind("! "))
+        if sentence_cut >= floor:
+            return sentence_cut + 1
 
-    print("\n[OUTPUT] Saved to chunks_accumulated.json")
-    print("=" * 100)
+        newline_cut = window.rfind("\n")
+        if newline_cut >= floor:
+            return newline_cut + 1
 
+        space_cut = window.rfind(" ")
+        if space_cut >= floor:
+            return space_cut + 1
 
-if __name__ == "__main__":
-    main()
+        return preferred
+
+    def _parse_offset(self, offset_value):
+        try:
+            if offset_value is None:
+                return None
+            return int(offset_value)
+        except Exception:
+            return None
+
+    def _normalize_label(self, raw_label):
+        if raw_label is None:
+            return None
+
+        label = str(raw_label).strip()
+        if not label:
+            return None
+
+        if label.isdigit():
+            return int(label)
+
+        roman_val = self._roman_to_int(label)
+        if roman_val:
+            return roman_val
+
+        return None
+
+    def _roman_to_int(self, roman):
+        roman_map = {
+            "I": 1,
+            "V": 5,
+            "X": 10,
+            "L": 50,
+            "C": 100,
+            "D": 500,
+            "M": 1000,
+        }
+        total = 0
+        prev = 0
+        for ch in reversed(str(roman).upper()):
+            if ch not in roman_map:
+                return None
+            value = roman_map[ch]
+            if value < prev:
+                total -= value
+            else:
+                total += value
+                prev = value
+        return total if total > 0 else None
+
+    def _physical_to_label(self, page_physical):
+        if page_physical is None:
+            return None
+
+        if self.offset is None:
+            return None
+
+        logical = int(page_physical) - int(self.offset)
+        return logical if logical > 0 else None
+
+    def _build_toc_anchors(self, toc_entries):
+        anchors = []
+
+        for entry in toc_entries:
+            title = (entry.get("title") or "").strip()
+            if len(title) < 2:
+                continue
+
+            label_int = self._normalize_label(entry.get("page_label"))
+            if label_int is None:
+                continue
+
+            level = (entry.get("level") or "unknown").lower()
+
+            anchors.append(
+                {
+                    "page_label": label_int,
+                    "title": title,
+                    "level": level,
+                }
+            )
+
+        anchors.sort(key=lambda x: x["page_label"])
+        return anchors
+
+    def _toc_context_for_label(self, page_label):
+        if page_label is None or not self.toc_anchors:
+            return None, None
+
+        chapter = None
+        subheading = None
+
+        for anchor in self.toc_anchors:
+            if anchor["page_label"] > page_label:
+                break
+
+            level = anchor["level"]
+            title = anchor["title"]
+
+            if level == "chapter":
+                chapter = title
+                subheading = None
+            elif level in {"section", "subsection"}:
+                subheading = title
+            elif re.match(r"^chapter\b", title.lower()):
+                chapter = title
+                subheading = None
+            else:
+                subheading = title
+
+        return chapter, subheading

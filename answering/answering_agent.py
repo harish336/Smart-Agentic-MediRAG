@@ -1,26 +1,19 @@
-﻿"""
-SmartChunk-RAG  Answering Agent (Pure RAG Production Version)
-
-This agent:
-- Performs intent detection
-- Performs hybrid retrieval for medical/book queries
-- Supports companion mode for normal conversation
-- Builds grounded prompts
-- Calls LLM
-- Formats response
-- Adds citations for evidence-mode answers
+"""
+SmartChunk-RAG - Answering Agent
 """
 
 import os
-import requests
-from typing import Dict, Optional
+import re
+from typing import Dict, List, Optional, Tuple
 
-from retriever.orchestrator import RetrieverOrchestrator
+import requests
+
+from answering.citation_manager import CitationManager
 from answering.intent_router import IntentRouter
 from answering.prompt_builder import PromptBuilder
-from answering.citation_manager import CitationManager
 from answering.response_formatter import ResponseFormatter
 from core.utils.logging_utils import get_component_logger
+from retriever.orchestrator import RetrieverOrchestrator
 
 
 logger = get_component_logger("AnsweringAgent", component="answering")
@@ -31,6 +24,7 @@ CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", DEFAULT_MODEL)
 KNOWLEDGE_MODEL = os.getenv("OLLAMA_KNOWLEDGE_MODEL", DEFAULT_MODEL)
 MEDICAL_RERANK_THRESHOLD = float(os.getenv("MEDICAL_RERANK_THRESHOLD", "0.18"))
 BOOK_RERANK_THRESHOLD = float(os.getenv("BOOK_RERANK_THRESHOLD", "0.05"))
+MAX_CONTEXT_CHUNKS = int(os.getenv("ANSWER_MAX_CONTEXT_CHUNKS", "8"))
 
 _router_instance: Optional[IntentRouter] = None
 _retriever_instance: Optional[RetrieverOrchestrator] = None
@@ -75,7 +69,6 @@ def get_formatter():
 
 
 class AnsweringAgent:
-
     def __init__(self, model: str = DEFAULT_MODEL):
         logger.info("=" * 80)
         logger.info("Initializing AnsweringAgent (Companion + Evidence RAG)")
@@ -95,7 +88,12 @@ class AnsweringAgent:
         logger.info("Knowledge model: %s", self.knowledge_model)
         logger.info("=" * 80)
 
-    def answer(self, query: str, retrieval_query: Optional[str] = None) -> Dict:
+    def answer(
+        self,
+        query: str,
+        retrieval_query: Optional[str] = None,
+        retrieval_filters: Optional[Dict] = None,
+    ) -> Dict:
         if not query or not query.strip():
             return {"response": "", "citations": [], "follow_up": ""}
 
@@ -107,12 +105,10 @@ class AnsweringAgent:
             if self.formatter is None:
                 self.formatter = get_formatter()
 
-            # Use clean user query for routing when memory/context has been injected.
             intent_input = retrieval_query or query
             intent = self.router.classify(intent_input)
             logger.info("Intent detected: %s", intent)
 
-            # Companion mode: normal conversation without forced retrieval.
             if intent == "general":
                 prompt = self.prompt_builder.build_companion(query=query)
                 llm_response = self._call_llm(
@@ -123,37 +119,38 @@ class AnsweringAgent:
                 formatted_response = self.formatter.format(llm_response, intent="general")
 
                 if not formatted_response:
-                    formatted_response = "I'm here with you. Tell me a bit more so I can help properly."
+                    formatted_response = (
+                        "I'm here with you. Tell me a bit more so I can help properly."
+                    )
 
-                return {
-                    "response": formatted_response,
-                    "citations": [],
-                    "follow_up": ""
-                }
+                return {"response": formatted_response, "citations": [], "follow_up": ""}
 
-            # Evidence mode for medical/book intents.
             if self.retriever is None:
                 self.retriever = get_retriever()
             if self.citation_manager is None:
                 self.citation_manager = get_citation_manager()
 
             search_query = retrieval_query or query
-            results = self.retriever.retrieve(
-                query=search_query,
-                mode="hybrid",
-                top_k=8,
-                initial_k=25
+            sub_questions = self._decompose_compound_query(search_query)
+            retrieval_results, coverage = self._retrieve_compound(
+                queries=sub_questions,
+                intent=intent,
+                retrieval_filters=retrieval_filters,
             )
 
-            if not results:
+            if not retrieval_results:
                 return {
                     "response": "dont have an answer",
                     "citations": [],
-                    "follow_up": self._build_follow_up(query, intent)
+                    "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
-            max_rerank_score = max(float(r.get("rerank_score", 0.0) or 0.0) for r in results)
-            rerank_threshold = MEDICAL_RERANK_THRESHOLD if intent == "medical" else BOOK_RERANK_THRESHOLD
+            max_rerank_score = max(
+                float(r.get("rerank_score", 0.0) or 0.0) for r in retrieval_results
+            )
+            rerank_threshold = (
+                MEDICAL_RERANK_THRESHOLD if intent == "medical" else BOOK_RERANK_THRESHOLD
+            )
             logger.info(
                 "Rerank gate check | intent=%s max_rerank_score=%.4f threshold=%.4f",
                 intent,
@@ -162,58 +159,151 @@ class AnsweringAgent:
             )
             if max_rerank_score < rerank_threshold:
                 return {
-                    "response": "Dont have an answer",
+                    "response": "dont have an answer",
                     "citations": [],
-                    "follow_up": self._build_follow_up(query, intent)
+                    "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
-            context_chunks = results[:6]
+            context_chunks = retrieval_results[:MAX_CONTEXT_CHUNKS]
+            prompt_query = self._augment_query_for_prompt(query, sub_questions)
 
             prompt = self.prompt_builder.build(
-                query=query,
+                query=prompt_query,
                 context_chunks=context_chunks,
-                intent=intent
+                intent=intent,
             )
 
             llm_response = self._call_llm(prompt)
             if not llm_response:
                 return {
-                    "response": "Dont have an answer",
+                    "response": "dont have an answer",
                     "citations": [],
-                    "follow_up": self._build_follow_up(query, intent)
+                    "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
             formatted_response = self.formatter.format(llm_response, intent=intent)
             if self._needs_follow_up(formatted_response):
                 return {
-                    "response": "Dont have an answer",
+                    "response": "dont have an answer",
                     "citations": [],
-                    "follow_up": self._build_follow_up(query, intent)
+                    "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
             citations = self.citation_manager.build(context_chunks)
             if not citations:
                 return {
-                    "response": "Dont have an answer",
+                    "response": "dont have an answer",
                     "citations": [],
-                    "follow_up": self._build_follow_up(query, intent)
+                    "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
-            return {
-                "response": formatted_response,
-                "citations": citations,
-                "follow_up": ""
-            }
+            return {"response": formatted_response, "citations": citations, "follow_up": ""}
 
         except Exception:
             logger.exception("Unhandled exception inside answer()")
             return {
                 "response": "",
                 "citations": [],
-                "follow_up": self._build_follow_up(query, "general")
+                "follow_up": self._build_follow_up(query, "general", []),
             }
 
-    def _call_llm(self, prompt: str, model: Optional[str] = None, generation_mode: str = "grounded") -> str:
+    def _retrieve_compound(
+        self,
+        queries: List[str],
+        intent: str,
+        retrieval_filters: Optional[Dict] = None,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        merged: List[Dict] = []
+        coverage: List[Dict] = []
+
+        for q in queries:
+            results = self.retriever.retrieve(
+                query=q,
+                mode="hybrid",
+                top_k=8,
+                initial_k=25,
+                filters=retrieval_filters,
+            )
+            merged.extend(results)
+            coverage.append(
+                {
+                    "sub_query": q,
+                    "result_count": len(results),
+                    "max_rerank_score": max(
+                        [float(r.get("rerank_score", 0.0) or 0.0) for r in results] + [0.0]
+                    ),
+                }
+            )
+
+        merged = self._deduplicate_results(merged)
+        merged.sort(key=lambda x: float(x.get("rerank_score", 0.0) or 0.0), reverse=True)
+
+        logger.info(
+            "Compound retrieval summary | sub_queries=%d merged_results=%d coverage=%s",
+            len(queries),
+            len(merged),
+            coverage,
+        )
+        return merged, coverage
+
+    def _deduplicate_results(self, results: List[Dict]) -> List[Dict]:
+        best = {}
+        for r in results:
+            doc_id = r.get("doc_id")
+            chunk_id = r.get("chunk_id")
+            if not doc_id or not chunk_id:
+                continue
+            key = (doc_id, chunk_id)
+            if key not in best:
+                best[key] = r
+                continue
+            if float(r.get("rerank_score", 0.0) or 0.0) > float(
+                best[key].get("rerank_score", 0.0) or 0.0
+            ):
+                best[key] = r
+        return list(best.values())
+
+    def _decompose_compound_query(self, query: str) -> List[str]:
+        text = (query or "").strip()
+        if not text:
+            return []
+
+        splitter = re.compile(
+            r"\s*(?:\?| and | also | plus | then | additionally | along with |,)\s*",
+            flags=re.IGNORECASE,
+        )
+        parts = [p.strip(" .") for p in splitter.split(text) if p and p.strip(" .")]
+        cleaned = []
+        for part in parts:
+            if len(part.split()) >= 3:
+                cleaned.append(part)
+
+        if not cleaned:
+            return [text]
+
+        deduped = []
+        seen = set()
+        for part in cleaned:
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(part)
+
+        return deduped[:3] if len(deduped) > 1 else [text]
+
+    def _augment_query_for_prompt(self, query: str, sub_questions: List[str]) -> str:
+        if len(sub_questions) <= 1:
+            return query
+        bullet_points = "\n".join([f"- {item}" for item in sub_questions])
+        return f"{query}\n\nSub-questions to address:\n{bullet_points}"
+
+    def _call_llm(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        generation_mode: str = "grounded",
+    ) -> str:
         selected_model = model or self.knowledge_model or self.model
         options = {
             "temperature": 0.1,
@@ -221,7 +311,7 @@ class AnsweringAgent:
             "top_k": 30,
             "repeat_penalty": 1.1,
             "seed": 42,
-            "num_predict": 700
+            "num_predict": 700,
         }
 
         if generation_mode == "creative_chat":
@@ -230,23 +320,18 @@ class AnsweringAgent:
                 "top_p": 0.9,
                 "top_k": 60,
                 "repeat_penalty": 1.05,
-                "num_predict": 700
+                "num_predict": 700,
             }
 
         payload = {
             "model": selected_model,
             "prompt": prompt,
             "stream": False,
-            "options": options
+            "options": options,
         }
 
         try:
-            response = requests.post(
-                OLLAMA_URL,
-                json=payload,
-                timeout=120
-            )
-
+            response = requests.post(OLLAMA_URL, json=payload, timeout=120)
             if response.status_code != 200:
                 logger.error("LLM error: %s body=%s", response.status_code, response.text[:500])
                 return ""
@@ -254,7 +339,6 @@ class AnsweringAgent:
             payload_json = response.json()
             llm_response = (payload_json.get("response", "") or "").strip()
 
-            # Persist raw LLM output in answering.log for traceability/debugging.
             logger.info(
                 "LLM_RESPONSE_START model=%s mode=%s chars=%d",
                 selected_model,
@@ -263,7 +347,6 @@ class AnsweringAgent:
             )
             logger.info("%s", llm_response if llm_response else "<empty>")
             logger.info("LLM_RESPONSE_END")
-
             return llm_response
 
         except Exception:
@@ -273,11 +356,32 @@ class AnsweringAgent:
     def _needs_follow_up(self, response_text: str) -> bool:
         if not response_text:
             return True
-        return response_text.strip().lower() == "dont have an answer"
+        normalized = response_text.strip().lower()
+        return normalized == "dont have an answer"
 
-    def _build_follow_up(self, query: str, intent: str) -> str:
+    def _build_follow_up(self, query: str, intent: str, coverage: List[Dict]) -> str:
+        weak_parts = [c for c in coverage if c.get("result_count", 0) == 0]
+
+        if weak_parts:
+            targets = "; ".join([c.get("sub_query", "") for c in weak_parts[:2] if c.get("sub_query")])
+            if targets:
+                return f"I need a bit more detail for: {targets}. Can you clarify those parts?"
+
         if intent == "medical":
-            return "Can you share symptoms, duration, severity, and relevant history so I can answer accurately?"
+            missing = []
+            lower_q = (query or "").lower()
+            if "how long" not in lower_q and "duration" not in lower_q:
+                missing.append("duration")
+            if "severe" not in lower_q and "intensity" not in lower_q:
+                missing.append("severity")
+            if "history" not in lower_q:
+                missing.append("relevant medical history")
+
+            if missing:
+                return f"Please share {', '.join(missing)} so I can answer accurately."
+            return "Please share symptoms, duration, severity, and relevant history so I can answer accurately."
+
         if intent == "book":
-            return "Please share the chapter, section, or key term you want me to focus on."
+            return "Please share the chapter, section, or key terms you want me to focus on."
+
         return "Can you clarify your question with a bit more detail?"

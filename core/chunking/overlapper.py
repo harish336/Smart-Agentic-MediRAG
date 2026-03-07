@@ -1,40 +1,23 @@
 """
-Overlapper Module (Standalone)
+Overlapper Module
 
 Purpose:
 - Apply pre-overlap and post-overlap to text chunks
 - Preserve chunk metadata
-- Verbose printing for debugging & verification
-
-Expected input:
-A JSON file containing a list of chunks like:
-
-[
-  {
-    "heading": "Chapter 1 Introduction",
-    "subheading": "1.1 Background",
-    "page": 2,
-    "text": "...."
-  }
-]
-
-This file CAN be run independently.
 """
 
-import sys
-import json
-from pprint import pprint
-from typing import List, Dict
+import re
 
-# ---------------- CONFIG ----------------
-PRE_OVERLAP = 300
-POST_OVERLAP = 300
+from config.system_loader import get_system_config
 
 
 class ChunkOverlapper:
 
     def __init__(self):
         print("[OVERLAP] Initialized")
+        cfg = get_system_config().get("overlap", {})
+        self.pre_overlap = int(cfg.get("pre_overlap", 150))
+        self.post_overlap = int(cfg.get("post_overlap", 150))
 
     def apply(self, chunks: list) -> list:
 
@@ -46,112 +29,93 @@ class ChunkOverlapper:
         for i, chunk in enumerate(chunks):
 
             new_chunk = chunk.copy()
+            text = new_chunk.get("text", "")
+            has_table = bool(new_chunk.get("table_html"))
 
             # Pre overlap
-            if i > 0:
-                prev_text = chunks[i - 1]["text"]
-                new_chunk["text"] = prev_text[-300:] + " " + new_chunk["text"]
+            if i > 0 and self.pre_overlap > 0 and not has_table:
+                prev_chunk = chunks[i - 1]
+                if self._is_context_compatible(prev_chunk, chunk) and not prev_chunk.get("table_html"):
+                    prev_text = prev_chunk.get("text", "")
+                    pre = self._tail_by_sentences(prev_text, self.pre_overlap)
+                    if pre:
+                        text = pre + "\n" + text
 
             # Post overlap
-            if i < len(chunks) - 1:
-                next_text = chunks[i + 1]["text"]
-                new_chunk["text"] += " " + next_text[:300]
+            if i < len(chunks) - 1 and self.post_overlap > 0 and not has_table:
+                next_chunk = chunks[i + 1]
+                if self._is_context_compatible(next_chunk, chunk) and not next_chunk.get("table_html"):
+                    next_text = next_chunk.get("text", "")
+                    post = self._head_by_sentences(next_text, self.post_overlap)
+                    if post:
+                        text += "\n" + post
 
+            new_chunk["text"] = text
             overlapped.append(new_chunk)
 
         return overlapped
 
-    # -------------------------------------------------
-    # STEP 1: Apply overlap
-    # -------------------------------------------------
-    def apply_overlap(self):
-        print("\n[STEP 1] Applying pre and post overlap...")
-        print(f"[CONFIG] PRE_OVERLAP  = {PRE_OVERLAP}")
-        print(f"[CONFIG] POST_OVERLAP = {POST_OVERLAP}")
+    def _is_context_compatible(self, candidate: dict, current: dict) -> bool:
+        if candidate.get("page_type") != current.get("page_type"):
+            return False
 
-        for idx, chunk in enumerate(self.chunks):
-            print("\n" + "-" * 80)
-            print(f"[PROCESSING CHUNK] Index: {idx}")
+        c_chapter = (candidate.get("chapter") or "").strip().lower()
+        n_chapter = (current.get("chapter") or "").strip().lower()
+        if c_chapter and n_chapter and c_chapter != n_chapter:
+            return False
 
-            base_text = chunk.get("text", "")
-            new_text = base_text
+        c_sub = (candidate.get("subheading") or "").strip().lower()
+        n_sub = (current.get("subheading") or "").strip().lower()
+        if c_sub and n_sub and c_sub != n_sub:
+            return False
 
-            print(f"[ORIGINAL SIZE] {len(base_text)} characters")
+        return True
 
-            # -------- PRE-OVERLAP --------
-            if idx > 0:
-                prev_text = self.chunks[idx - 1].get("text", "")
-                pre = prev_text[-PRE_OVERLAP:]
-                new_text = pre + "\n" + new_text
-                print(f"[PRE-OVERLAP] Added {len(pre)} characters")
+    def _split_sentences(self, text: str) -> list:
+        source = re.sub(r"\s+", " ", (text or "").strip())
+        if not source:
+            return []
 
-            # -------- POST-OVERLAP --------
-            if idx < len(self.chunks) - 1:
-                next_text = self.chunks[idx + 1].get("text", "")
-                post = next_text[:POST_OVERLAP]
-                new_text = new_text + "\n" + post
-                print(f"[POST-OVERLAP] Added {len(post)} characters")
+        parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", source) if s.strip()]
+        if parts:
+            return parts
+        return [source]
 
-            print(f"[FINAL SIZE] {len(new_text)} characters")
+    def _word_count(self, text: str) -> int:
+        return len(re.findall(r"\S+", text or ""))
 
-            overlapped_chunk = dict(chunk)
-            overlapped_chunk["text"] = new_text
-            overlapped_chunk["overlap"] = {
-                "pre": PRE_OVERLAP if idx > 0 else 0,
-                "post": POST_OVERLAP if idx < len(self.chunks) - 1 else 0
-            }
+    def _tail_by_sentences(self, text: str, max_words: int) -> str:
+        source = (text or "").strip()
+        if not source or max_words <= 0:
+            return ""
 
-            self.overlapped_chunks.append(overlapped_chunk)
+        sentences = self._split_sentences(source)
+        selected = []
+        total_words = 0
+        for sentence in reversed(sentences):
+            count = self._word_count(sentence)
+            if selected and (total_words + count) > max_words:
+                break
+            selected.append(sentence)
+            total_words += count
+            if total_words >= max_words:
+                break
+        return " ".join(reversed(selected)).strip()
 
-        print("\n[STEP 2] Overlap application completed")
-        print(f"[INFO] Total chunks processed: {len(self.overlapped_chunks)}")
+    def _head_by_sentences(self, text: str, max_words: int) -> str:
+        source = (text or "").strip()
+        if not source or max_words <= 0:
+            return ""
 
-        return self.overlapped_chunks
-
-
-# ============================================================
-# STANDALONE RUNNER
-# ============================================================
-def main():
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python overlapper.py <chunks_json>")
-        print("\nExample:")
-        print("  python overlapper.py chunks_output.json")
-        sys.exit(1)
-
-    input_file = sys.argv[1]
-
-    print("=" * 100)
-    print("CHUNK OVERLAPPER STARTED")
-    print(f"Input file: {input_file}")
-    print("=" * 100)
-
-    try:
-        with open(input_file, "r", encoding="utf-8") as f:
-            chunks = json.load(f)
-    except Exception as e:
-        print(f"[ERROR] Failed to load chunks JSON: {e}")
-        sys.exit(1)
-
-    print(f"[INFO] Chunks loaded: {len(chunks)}")
-
-    overlapper = ChunkOverlapper(chunks)
-    overlapped_chunks = overlapper.apply_overlap()
-
-    print("\n[FINAL OVERLAPPED CHUNKS]")
-    pprint(overlapped_chunks, width=130)
-
-    output_file = "chunks_overlapped.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(overlapped_chunks, f, indent=2)
-
-    print("\n[OUTPUT]")
-    print(f"Overlapped chunks saved to: {output_file}")
-    print("=" * 100)
-    print("CHUNK OVERLAPPER COMPLETED")
-    print("=" * 100)
-
-
-if __name__ == "__main__":
-    main()
+        sentences = self._split_sentences(source)
+        selected = []
+        total_words = 0
+        for sentence in sentences:
+            count = self._word_count(sentence)
+            if selected and (total_words + count) > max_words:
+                break
+            selected.append(sentence)
+            total_words += count
+            if total_words >= max_words:
+                break
+        return " ".join(selected).strip()

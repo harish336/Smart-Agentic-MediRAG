@@ -30,7 +30,7 @@ import os
 
 class ChromaStore:
 
-    def __init__(self):
+    def __init__(self, collection_name: str | None = None):
 
         print("=" * 70)
         print("[VECTOR STORE] Initializing...")
@@ -45,7 +45,7 @@ class ChromaStore:
         self.persist_path = vector_cfg.get("persist_path", "./vector_store")
 
         collection_cfg = vector_cfg.get("collection", {})
-        self.collection_name = collection_cfg.get("name", "smart_chunks")
+        self.collection_name = collection_name or collection_cfg.get("name", "smart_chunks")
         self.distance_metric = collection_cfg.get("distance_metric", "cosine")
 
         self.fail_soft = system_config["project"].get("fail_soft", True)
@@ -149,7 +149,7 @@ class ChromaStore:
     # Query
     # -------------------------------------------------
 
-    def query(self, query_embedding, top_k=5):
+    def query(self, query_embedding, top_k=5, where_filter=None):
 
         if not self.enabled or self.collection is None:
             print("[VECTOR STORE] Query skipped — store disabled")
@@ -158,10 +158,14 @@ class ChromaStore:
         try:
             print(f"[VECTOR STORE] Running similarity search (top_k={top_k})")
 
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k
-            )
+            query_kwargs = {
+                "query_embeddings": [query_embedding],
+                "n_results": top_k,
+            }
+            if where_filter:
+                query_kwargs["where"] = where_filter
+
+            results = self.collection.query(**query_kwargs)
 
             return results
 

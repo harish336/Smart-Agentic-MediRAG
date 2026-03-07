@@ -44,6 +44,17 @@ class ResponseFormatter:
         self.spacing_pattern: Pattern = re.compile(r"\n{3,}")
         self.trailing_ws_pattern: Pattern = re.compile(r"[ \t]+$", re.MULTILINE)
         self.enumerated_item_pattern: Pattern = re.compile(r"^\s*(\d+)[\.\)]\s+", re.MULTILINE)
+        self.html_break_pattern: Pattern = re.compile(r"(?i)<br\s*/?>")
+        self.html_tag_pattern: Pattern = re.compile(r"</?[a-zA-Z][^>]*>")
+        self.meta_grounding_sentence_pattern: Pattern = re.compile(
+            r"(?im)^[^\n.!?]*\b(?:provided|given)\s+"
+            r"(?:context|sources?|docs?|documents?|text|content|information)\b[^\n.!?]*[.!?]?\s*$"
+        )
+        self.meta_grounding_phrase_pattern: Pattern = re.compile(
+            r"(?i)\b(?:based on|according to|from)\s+(?:the\s+)?"
+            r"(?:provided|given)\s+"
+            r"(?:context|sources?|docs?|documents?|text|content|information)\b[,:\-\s]*"
+        )
 
         # comprehensive punctuation mapping — extend as needed
         self._replacement_map: Dict[str, str] = {
@@ -121,21 +132,22 @@ class ResponseFormatter:
 
         # 6. remove control characters except \n, \r, \t
         text = self._remove_control_chars(text)
+        text = self._replace_html_breaks(text)
+        text = self._strip_html_tags(text)
 
         # 7. extract and group links (keeps original link text)
         text = self._extract_and_group_links(text)
 
         # 8. collapse excessive blank lines and trailing spaces
+        text = self._remove_meta_grounding_language(text)
+        text = self._normalize_tabular_output(text)
+        text = self._improve_readability_layout(text)
         text = self._clean_spacing(text)
         text = self._normalize_list_layout(text)
 
         # 9. stable behavior for "dont have an answer"
         if "dont have an answer" in text.lower():
             return "dont have an answer"
-
-        # 10. intent-based header for medical/book
-        if intent in {"medical", "book"} and not text.startswith("### "):
-            text = f"### Direct Answer\n{text}"
 
         return text.strip()
 
@@ -190,6 +202,12 @@ class ResponseFormatter:
                 continue
             filtered_chars.append(ch)
         return "".join(filtered_chars)
+
+    def _replace_html_breaks(self, text: str) -> str:
+        return self.html_break_pattern.sub("\n", text)
+
+    def _strip_html_tags(self, text: str) -> str:
+        return self.html_tag_pattern.sub("", text)
 
     def _extract_and_group_links(self, text: str) -> str:
         extracted_urls: List[str] = []
@@ -248,6 +266,89 @@ class ResponseFormatter:
             normalized_lines.append(line)
 
         return "\n".join(normalized_lines).strip()
+
+    def _normalize_tabular_output(self, text: str) -> str:
+        """
+        Convert tab-separated pseudo tables into proper markdown tables.
+        Example handled:
+        Chapter<TAB>Topic
+        1<TAB>Intro
+        2<TAB>Basics
+        """
+        raw = (text or "").replace("\r\n", "\n").strip()
+        if not raw:
+            return ""
+
+        lines = [ln for ln in raw.split("\n") if ln.strip()]
+        if len(lines) < 2:
+            return raw
+
+        header_line = lines[0]
+        if "\t" not in header_line:
+            return raw
+
+        headers = [h.strip() for h in header_line.split("\t") if h.strip()]
+        if len(headers) < 2:
+            return raw
+
+        width = len(headers)
+        rows: List[List[str]] = []
+        current_row: Optional[List[str]] = None
+
+        for line in lines[1:]:
+            if "\t" in line:
+                parts = line.split("\t", width - 1)
+                if len(parts) < width:
+                    continue
+                current_row = [part.strip() for part in parts]
+                rows.append(current_row)
+                continue
+
+            # Continuation line for previous row's last cell
+            if current_row is not None:
+                current_row[-1] = f"{current_row[-1]}; {line.strip()}".strip(" ;")
+
+        if not rows:
+            return raw
+
+        def _clean_cell(cell: str) -> str:
+            cleaned = re.sub(r"\s{2,}", " ", str(cell or "")).strip()
+            return cleaned.replace("|", r"\|")
+
+        md_header = "| " + " | ".join(_clean_cell(h) for h in headers) + " |"
+        md_sep = "| " + " | ".join(["---"] * len(headers)) + " |"
+        md_rows = []
+        for row in rows:
+            padded = row + [""] * max(0, width - len(row))
+            md_rows.append("| " + " | ".join(_clean_cell(c) for c in padded[:width]) + " |")
+
+        return "\n".join([md_header, md_sep, *md_rows]).strip()
+
+    def _remove_meta_grounding_language(self, text: str) -> str:
+        cleaned = self.meta_grounding_sentence_pattern.sub("", text)
+        cleaned = self.meta_grounding_phrase_pattern.sub("", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return cleaned.strip()
+
+    def _improve_readability_layout(self, text: str) -> str:
+        cleaned = (text or "").replace("\r\n", "\n").strip()
+        if not cleaned:
+            return ""
+
+        # If numbered items were generated inline, put each on its own line.
+        cleaned = re.sub(r"(?<=[\.\:\;])\s+(\d+\.\s+)", r"\n\1", cleaned)
+
+        # If response is one long paragraph, split it into short readable blocks.
+        if "\n" not in cleaned and len(cleaned) > 260:
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+            if len(sentences) >= 4:
+                blocks: List[str] = []
+                for i in range(0, len(sentences), 2):
+                    blocks.append(" ".join(sentences[i:i + 2]))
+                cleaned = "\n\n".join(blocks)
+
+        return cleaned.strip()
 
 
 # -----------------------

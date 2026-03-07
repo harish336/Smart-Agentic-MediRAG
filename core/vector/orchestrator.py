@@ -35,24 +35,44 @@ from config.system_loader import (
 
 class VectorOrchestrator:
 
-    def __init__(self, pdf_path: str):
+    def __init__(
+        self,
+        pdf_path: str,
+        owner_user_id: str | None = None,
+        scope: str = "global",
+    ):
 
         print("=" * 80)
         print("VECTOR ORCHESTRATOR INITIALIZING")
         print("=" * 80)
 
         self.pdf_path = pdf_path
+        self.owner_user_id = (owner_user_id or "").strip() or None
+        self.scope = (scope or "global").strip().lower()
+        if self.scope not in {"global", "user"}:
+            self.scope = "global"
 
         # Load configs
         self.db_config = get_database_config()
         self.system_config = get_system_config()
 
         self.fail_soft = self.system_config["project"].get("fail_soft", True)
-        self.batch_size = self.system_config["performance"].get("batch_size", 16)
+        indexing_batch_size = (
+            self.db_config.get("vector_db", {})
+            .get("indexing", {})
+            .get("batch_size")
+        )
+        self.batch_size = int(
+            indexing_batch_size
+            or self.system_config.get("performance", {}).get("batch_size", 16)
+        )
 
         # Initialize components
         self.embedder = VectorEmbedder()
-        self.store = ChromaStore()
+        collection_name = None
+        if self.scope == "user" and self.owner_user_id:
+            collection_name = f"smart_chunks_user_{self.owner_user_id}"
+        self.store = ChromaStore(collection_name=collection_name)
         self.validator = VectorChunkValidator()
 
         # Deterministic document ID
@@ -160,8 +180,11 @@ class VectorOrchestrator:
                     "chunk_id": chunk["chunk_id"],
                     "chapter": chunk.get("chapter"),
                     "subheading": chunk.get("subheading"),
+                    "page_type": chunk.get("page_type"),
                     "page_label": chunk.get("page_label"),
                     "page_physical": chunk.get("page_physical"),
+                    "owner_user_id": self.owner_user_id,
+                    "scope": self.scope,
                 })
 
             self.store.upsert(

@@ -5,19 +5,21 @@
 project:
   name: "SmartChunk-RAG"
   environment: "development"     # development | production
-  fail_soft: true                # system must not crash on partial failures
+  fail_soft: true                 # system must not crash on partial failures
 
 # ---------- PDF Processing ----------
 pdf:
-  max_pages: null                # null = no limit
+  max_pages: null                 # null = no limit
   render_dpi: 200
   extract_images: true
   preserve_layout: true
 
 # ---------- TOC Detection ----------
+# NOTE: most TOC runtime knobs are currently hardcoded in code.
+# This section is retained for forward compatibility.
 toc:
   enabled: true
-  max_scan_pages: 15              # scan only initial pages
+  max_scan_pages: 15              # code currently uses hardcoded 15
   allow_llm_verification: true
 
   keyword_detection:
@@ -29,6 +31,7 @@ toc:
     skip_if_not_found: true       # jump directly to style chunking
 
 # ---------- TOC Extraction ----------
+# NOTE: extractor classes currently use constructor defaults.
 toc_extraction:
   prefer_structured_pdf: true
   allow_ocr_fallback: true
@@ -43,7 +46,7 @@ offset:
     min_anchor_matches: 2
     max_pages_to_search: 50
 
-  frequency_strategy: "max"       # max | median
+  frequency_strategy: "max"      # max | median
   clamp_negative_offset: true
 
   page_label_handling:
@@ -56,6 +59,7 @@ style:
   enabled: true
 
   font_size_analysis:
+    sample_pages: 120             # actively used by StyleDetector
     min_frequency_ratio: 0.05
     ignore_extreme_sizes: true
 
@@ -74,13 +78,13 @@ chunking:
   strategy: "hierarchical"
 
   accumulation:
-    anchor_level: "subheading"    # chapter | subheading
+    anchor_level: "subheading"   # chapter | subheading
     allow_cross_page: true
     reset_on_new_chapter: true
 
   size:
-    max_chars: 1500
-    min_chars: 200
+    max_chars: 1200               # tighter chunks improve retrieval precision
+    min_chars: 180
     split_strategy: "sentence"
 
   sorting:
@@ -89,8 +93,8 @@ chunking:
 # ---------- Overlap ----------
 overlap:
   enabled: true
-  pre_overlap: 300
-  post_overlap: 300
+  pre_overlap: 120                # interpreted as word budget (sentence-aware)
+  post_overlap: 120               # interpreted as word budget (sentence-aware)
 
 # ---------- Image Handling ----------
 images:
@@ -116,11 +120,17 @@ validation:
 
 # ---------- Retriever Defaults ----------
 retrieval:
-  default_top_k: 10
+  default_top_k: 8
   allow_hybrid: true
+  query_variants: 3               # actively used by RetrieverOrchestrator
   graph_expansion_depth: 2
 
+# Compatibility section (GraphRetriever currently reads this key path)
+retriever:
+  graph_max_expanded: 40
+
 # ---------- Answering ----------
+# NOTE: answering runtime currently relies on env vars for key thresholds.
 answering:
   require_citations: true
   refuse_without_context: true
@@ -137,6 +147,8 @@ performance:
   parallel_pdf_pages: 4
   batch_processing: true
   batch_size: 16
+  enable_caching: true            # actively used by BaseRetriever/VectorRetriever
+  cache_size: 512                 # actively used by BaseRetriever/VectorRetriever
 
 # ---------- Debug / Dev ----------
 debug:

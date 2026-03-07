@@ -20,7 +20,9 @@ import {
   retrieveChunksForVerification,
 } from "./api/admin";
 
-const { askQuestion, deleteThread, listThreadMessages, listThreads } = answerApi;
+const { askQuestion, deleteChatUpload, deleteThread, listChatUploads, listThreadMessages, listThreads, uploadChatFiles } = answerApi;
+const saveCanvasEditApi = answerApi.saveCanvasEdit || (async () => ({ saved: false }));
+const THEME_STORAGE_KEY = "ui_theme";
 
 // Safely extract renameThread if it exists in the API, otherwise provide a fallback
 // Fixed: Wrapped the fallback async arrow function in parentheses to satisfy Babel's parser
@@ -45,6 +47,81 @@ function clearSession() {
   localStorage.removeItem("access_token");
   localStorage.removeItem("refresh_token");
   localStorage.removeItem("role");
+}
+
+function getInitialTheme() {
+  const stored = localStorage.getItem(THEME_STORAGE_KEY);
+  if (stored === "light" || stored === "dark") return stored;
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyTheme(theme) {
+  const root = document.documentElement;
+  root.classList.remove("theme-light", "theme-dark");
+  root.classList.add(theme === "light" ? "theme-light" : "theme-dark");
+}
+
+function playCompletionSound() {
+  try {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const oscillator = ctx.createOscillator();
+    const gain = ctx.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(880, ctx.currentTime);
+    oscillator.frequency.setValueAtTime(1320, ctx.currentTime + 0.09);
+    gain.gain.setValueAtTime(0.001, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.16, ctx.currentTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.2);
+    oscillator.connect(gain);
+    gain.connect(ctx.destination);
+    oscillator.start();
+    oscillator.stop(ctx.currentTime + 0.22);
+  } catch (_) {
+    // no-op
+  }
+}
+
+async function notifyUser(title, body) {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  try {
+    if (Notification.permission === "granted") {
+      new Notification(title, { body });
+      return;
+    }
+    if (Notification.permission !== "denied") {
+      const permission = await Notification.requestPermission();
+      if (permission === "granted") {
+        new Notification(title, { body });
+      }
+    }
+  } catch (_) {
+    // no-op
+  }
+}
+
+function ThemeToggle({ theme, onToggle }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={`fixed right-4 top-4 z-[120] inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold backdrop-blur-xl shadow-lg transition ${
+        theme === "dark"
+          ? "border-slate-700/60 bg-[#0b1016]/85 text-slate-200 hover:border-cyan-500/40 hover:text-white"
+          : "border-slate-300/90 bg-white/95 text-slate-700 hover:border-cyan-500/50 hover:text-slate-900"
+      }`}
+      aria-label="Toggle light and dark theme"
+      title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+    >
+      {theme === "dark" ? (
+        <svg className="h-4 w-4 text-amber-300" viewBox="0 0 24 24" fill="currentColor"><path d="M12 18a6 6 0 1 1 0-12 6 6 0 0 1 0 12Zm0-16a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0V3a1 1 0 0 1 1-1Zm0 18a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1ZM2 13a1 1 0 1 1 0-2h2a1 1 0 1 1 0 2H2Zm18 0a1 1 0 1 1 0-2h2a1 1 0 1 1 0 2h-2ZM4.22 5.64a1 1 0 1 1 1.42-1.42l1.41 1.42a1 1 0 0 1-1.41 1.41L4.22 5.64Zm12.73 12.73a1 1 0 0 1 1.41-1.41l1.42 1.41a1 1 0 0 1-1.42 1.42l-1.41-1.42ZM18.36 4.22a1 1 0 1 1 1.42 1.42l-1.42 1.41a1 1 0 0 1-1.41-1.41l1.41-1.42ZM5.64 16.95a1 1 0 0 1 1.41 1.41l-1.41 1.42a1 1 0 0 1-1.42-1.42l1.42-1.41Z" /></svg>
+      ) : (
+        <svg className="h-4 w-4 text-slate-700" viewBox="0 0 24 24" fill="currentColor"><path d="M11.95 2a10 10 0 1 0 10.05 10.95 1 1 0 0 0-1.43-.95 8 8 0 0 1-10.52-10.5A1 1 0 0 0 11.95 2Z" /></svg>
+      )}
+      {theme === "dark" ? "Light" : "Dark"}
+    </button>
+  );
 }
 
 function Toasts({ items }) {
@@ -98,17 +175,163 @@ function formatAssistantContent(content) {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-  if (!normalized) return "No response.";
-  if (normalized.toLowerCase() === "dont have an answer") {
+  const tableRowFixed = normalized.replace(/\s\|\s\|(?=\s*[-:\w])/g, " |\n|");
+
+  if (!tableRowFixed) return "No response.";
+  if (tableRowFixed.toLowerCase() === "dont have an answer") {
     return "I don't have enough reliable context to answer that yet. Please share a bit more detail.";
   }
 
-  return normalized;
+  return tableRowFixed;
 }
 
-function CitationBox({ citations }) {
+function countWords(content) {
+  const text = typeof content === "string" ? content.trim() : "";
+  if (!text) return 0;
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+const CHAT_CANVAS_WORD_THRESHOLD = 300;
+const CHAT_CANVAS_PREVIEW_WORDS = Math.max(80, Math.floor(CHAT_CANVAS_WORD_THRESHOLD / 2));
+const CHAT_CANVAS_PREVIEW_HINT = "[Open Canvas to view the full response]";
+
+function stripCanvasPreviewHint(content) {
+  return String(content || "")
+    .replace(/\n?\n?\[Open Canvas to view the full response\]\s*$/i, "")
+    .trim();
+}
+
+function makeCanvasPreview(content, previewWords = CHAT_CANVAS_PREVIEW_WORDS) {
+  const normalized = formatAssistantContent(content);
+  const clean = stripCanvasPreviewHint(normalized);
+  const hasTable = parseMarkdownTables(clean).length > 0;
+  if (hasTable) {
+    const lines = clean.split("\n");
+    const words = clean.split(/\s+/).filter(Boolean);
+    if (words.length <= previewWords) return clean;
+    const previewLineCount = Math.max(8, Math.ceil(lines.length / 2));
+    return `${lines.slice(0, previewLineCount).join("\n").trim()}\n\n${CHAT_CANVAS_PREVIEW_HINT}`;
+  }
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length <= previewWords) return clean;
+  return `${words.slice(0, previewWords).join(" ")}\n\n${CHAT_CANVAS_PREVIEW_HINT}`;
+}
+
+function buildFinalQueryByMode(query, mode) {
+  const normalizedQuery = String(query || "").trim();
+  if (!normalizedQuery) return "";
+  if (mode === "pro") {
+    return /\bin book$/i.test(normalizedQuery) ? normalizedQuery : `${normalizedQuery} in book`;
+  }
+  return normalizedQuery;
+}
+
+function parseMarkdownTableLine(line) {
+  const text = String(line || "").trim();
+  if (!text.includes("|")) return [];
+  let core = text;
+  if (core.startsWith("|")) core = core.slice(1);
+  if (core.endsWith("|")) core = core.slice(0, -1);
+  return core.split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparator(line) {
+  const text = String(line || "").trim();
+  if (!text) return false;
+  if (!text.includes("-")) return false;
+  return /^[\s|:-]+$/.test(text);
+}
+
+function normalizeTableShape(headers, rows) {
+  const headerCells = Array.isArray(headers) ? [...headers] : [];
+  const rowCells = Array.isArray(rows) ? rows.map((row) => (Array.isArray(row) ? [...row] : [])) : [];
+  const width = Math.max(1, headerCells.length, ...rowCells.map((row) => row.length));
+  const paddedHeaders = Array.from({ length: width }, (_, index) => (headerCells[index] ?? "").trim());
+  const paddedRows = rowCells.map((row) =>
+    Array.from({ length: width }, (_, index) => String(row[index] ?? "").trim())
+  );
+  return { headers: paddedHeaders, rows: paddedRows };
+}
+
+function parseMarkdownTables(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const tables = [];
+
+  for (let i = 0; i < lines.length - 1; i += 1) {
+    const headerLine = lines[i];
+    const separatorLine = lines[i + 1];
+    if (!headerLine.includes("|") || !isMarkdownTableSeparator(separatorLine)) continue;
+
+    const headers = parseMarkdownTableLine(headerLine);
+    if (headers.length === 0) continue;
+
+    const rows = [];
+    let endLine = i + 1;
+    for (let j = i + 2; j < lines.length; j += 1) {
+      const rowLine = lines[j];
+      if (!rowLine.includes("|") || !String(rowLine).trim()) break;
+      const cells = parseMarkdownTableLine(rowLine);
+      if (cells.length === 0) break;
+      rows.push(cells);
+      endLine = j;
+    }
+
+    const normalized = normalizeTableShape(headers, rows);
+    tables.push({
+      startLine: i,
+      endLine,
+      headers: normalized.headers,
+      rows: normalized.rows,
+    });
+    i = endLine;
+  }
+
+  return tables;
+}
+
+function buildMarkdownTable(headers, rows) {
+  const normalized = normalizeTableShape(headers, rows);
+  const escapeCell = (value) => String(value ?? "").replace(/\|/g, "\\|").trim();
+  const headerLine = `| ${normalized.headers.map(escapeCell).join(" | ")} |`;
+  const separatorLine = `| ${normalized.headers.map(() => "---").join(" | ")} |`;
+  const rowLines = normalized.rows.map((row) => `| ${row.map(escapeCell).join(" | ")} |`);
+  return [headerLine, separatorLine, ...rowLines].join("\n");
+}
+
+function CitationBox({ citations, addToast }) {
   const [open, setOpen] = useState(false);
+  const [openingDocId, setOpeningDocId] = useState("");
   if (!Array.isArray(citations) || citations.length === 0) return null;
+
+  const handleOpenCitationPdf = async (citation) => {
+    const docId = String(citation?.document?.doc_id || "").trim();
+    if (!docId) {
+      addToast?.("Citation has no valid document ID", "error");
+      return;
+    }
+
+    // Open the tab immediately from the click event to avoid popup blockers.
+    const popup = window.open("", "_blank");
+    if (!popup) {
+      addToast?.("Could not open a new tab. Please allow popups for this site.", "error");
+      return;
+    }
+    popup.document.title = "Loading citation PDF...";
+    popup.document.body.innerHTML = "<p style='font-family:sans-serif;padding:16px'>Loading PDF...</p>";
+
+    try {
+      setOpeningDocId(docId);
+      const blob = await answerApi.fetchCitationPdfBlob(docId);
+      const blobUrl = window.URL.createObjectURL(blob);
+      popup.location.replace(blobUrl);
+      window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 60000);
+    } catch (error) {
+      popup.close();
+      addToast?.(getErrorMessage(error, "Failed to open citation PDF"), "error");
+    } finally {
+      setOpeningDocId("");
+    }
+  };
 
   return (
     <div className="mt-6 rounded-2xl border border-slate-700/40 bg-[#0b1016]/50 overflow-hidden transition-all duration-500 shadow-inner backdrop-blur-sm">
@@ -140,7 +363,14 @@ function CitationBox({ citations }) {
           const section = citation?.location?.subheading || "N/A";
           
           return (
-            <div key={citation?.id || idx} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3.5 text-xs text-slate-300 hover:border-cyan-500/40 hover:bg-slate-800/80 transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_4px_20px_rgba(6,182,212,0.1)] group/cit cursor-default">
+            <button
+              key={citation?.id || idx}
+              type="button"
+              onClick={() => handleOpenCitationPdf(citation)}
+              className="w-full text-left rounded-xl border border-slate-800 bg-slate-900/40 p-3.5 text-xs text-slate-300 hover:border-cyan-500/40 hover:bg-slate-800/80 transition-all duration-300 hover:-translate-y-1 hover:shadow-[0_4px_20px_rgba(6,182,212,0.1)] group/cit cursor-pointer disabled:opacity-60 disabled:cursor-wait"
+              disabled={openingDocId === docId}
+              title={openingDocId === docId ? "Opening PDF..." : "Click to open source PDF"}
+            >
               <div className="font-bold text-cyan-400 mb-2.5 flex items-center gap-2 border-b border-slate-800 pb-2 group-hover/cit:border-cyan-500/30 transition-colors">
                 <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse shadow-[0_0_8px_currentColor]"></span>
                 {citation?.id || `CITATION-${String(idx + 1).padStart(3, "0")}`}
@@ -151,8 +381,9 @@ function CitationBox({ citations }) {
                 <div className="flex justify-between items-center"><span className="text-slate-500 font-medium">Page:</span> <span className="text-emerald-300 font-mono bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">{page}</span></div>
                 <div className="flex justify-between items-center"><span className="text-slate-500 font-medium">Chapter:</span> <span className="truncate ml-2">{chapter}</span></div>
                 <div className="flex justify-between items-center"><span className="text-slate-500 font-medium">Section:</span> <span className="truncate ml-2">{section}</span></div>
+                <div className="pt-1 text-[11px] text-cyan-300/80">{openingDocId === docId ? "Opening PDF..." : "Click to open PDF"}</div>
               </div>
-            </div>
+            </button>
           );
         })}
       </div>
@@ -251,7 +482,7 @@ function AuthPanel({ onAuthSuccess, addToast }) {
                 </div>
                 <div className="group">
                   <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider ml-1 mb-2 block group-focus-within:text-emerald-400 transition-colors">Password</label>
-                  <input type="password" value={form.password} onChange={(e) => updateField("password", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 placeholder:text-slate-600 shadow-inner" placeholder="••••••••" />
+                  <input type="password" value={form.password} onChange={(e) => updateField("password", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 placeholder:text-slate-600 shadow-inner" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" />
                 </div>
               </div>
               <button type="submit" disabled={loading} className="w-full rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-4 text-sm font-bold text-white shadow-[0_8px_25px_rgba(16,185,129,0.3)] hover:shadow-[0_12px_35px_rgba(16,185,129,0.4)] transition-all duration-300 active:scale-[0.98] disabled:opacity-50 mt-4 relative overflow-hidden group">
@@ -289,7 +520,7 @@ function AuthPanel({ onAuthSuccess, addToast }) {
               </div>
               <div className="group">
                 <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider ml-1 mb-2 block group-focus-within:text-emerald-400 transition-colors">New Password</label>
-                <input type="password" value={form.newPassword} onChange={(e) => updateField("newPassword", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner" placeholder="••••••••" />
+                <input type="password" value={form.newPassword} onChange={(e) => updateField("newPassword", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" />
               </div>
               <button type="submit" disabled={loading} className="w-full rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-4 text-sm font-bold text-white shadow-[0_8px_25px_rgba(16,185,129,0.3)] hover:shadow-[0_12px_35px_rgba(16,185,129,0.4)] transition-all duration-300 active:scale-[0.98] disabled:opacity-50">
                 {loading ? "Updating..." : "Reset Password"}
@@ -389,11 +620,20 @@ function AdminLoginPanel({ addToast, onAdminAuthSuccess, onBackToChat }) {
   );
 }
 
-function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
+function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
   const [threads, setThreads] = useState([]);
   const [threadId, setThreadId] = useState("");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
+  const [chatIndexEnabled, setChatIndexEnabled] = useState(false);
+  const [chatMode, setChatMode] = useState("fast");
+  const [chatUploading, setChatUploading] = useState(false);
+  const [chatUploadActionId, setChatUploadActionId] = useState("");
+  const [chatUploads, setChatUploads] = useState([]);
+  const [pendingChatFiles, setPendingChatFiles] = useState([]);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(300);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   
   // Renaming State
   const [editingThreadId, setEditingThreadId] = useState(null);
@@ -402,12 +642,57 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
   const [loadingThreads, setLoadingThreads] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingAsk, setLoadingAsk] = useState(false);
+  const [editingQuestionIndex, setEditingQuestionIndex] = useState(null);
+  const [editingQuestionValue, setEditingQuestionValue] = useState("");
+  const [regeneratingQuestionIndex, setRegeneratingQuestionIndex] = useState(null);
+  const [canvasOpen, setCanvasOpen] = useState(false);
+  const [canvasDraft, setCanvasDraft] = useState("");
+  const [canvasOriginal, setCanvasOriginal] = useState("");
+  const [canvasThreadId, setCanvasThreadId] = useState("");
+  const [canvasSaving, setCanvasSaving] = useState(false);
+  const [canvasView, setCanvasView] = useState("split");
+  const [canvasEditSurface, setCanvasEditSurface] = useState("table");
+  const [canvasSelectedTableIndex, setCanvasSelectedTableIndex] = useState(0);
   const bottomRef = useRef(null);
+  const chatFileInputRef = useRef(null);
+  const chatUploadPollRef = useRef(null);
+  const askAbortRef = useRef(null);
+  const sidebarResizeRef = useRef({ startX: 0, startWidth: 300 });
 
   const activeThread = useMemo(() => threads.find((thread) => thread.id === threadId) || null, [threads, threadId]);
   const isAdmin = (user?.role || "") === "admin";
+  const canvasTables = useMemo(() => parseMarkdownTables(canvasDraft), [canvasDraft]);
+  const activeCanvasTable = canvasTables[canvasSelectedTableIndex] || null;
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loadingAsk]);
+
+  useEffect(() => {
+    if (!isResizingSidebar) return undefined;
+    const onMouseMove = (event) => {
+      const delta = event.clientX - sidebarResizeRef.current.startX;
+      const nextWidth = Math.max(240, Math.min(520, sidebarResizeRef.current.startWidth + delta));
+      setSidebarWidth(nextWidth);
+    };
+    const onMouseUp = () => setIsResizingSidebar(false);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [isResizingSidebar]);
+
+  const hasPendingUploads = useMemo(
+    () => chatUploads.some((item) => item.status === "queued" || item.status === "processing"),
+    [chatUploads]
+  );
+  const readyUploadIds = useMemo(
+    () =>
+      chatUploads
+        .filter((item) => item.status === "completed")
+        .map((item) => item.id),
+    [chatUploads]
+  );
 
   const loadThreads = async () => {
     try { setLoadingThreads(true); const data = await listThreads(); setThreads(data); } 
@@ -417,6 +702,68 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
 
   useEffect(() => { loadThreads(); }, []);
 
+  const loadChatUploads = async () => {
+    try {
+      const uploads = await listChatUploads({ thread_id: threadId || null, limit: 80 });
+      setChatUploads(Array.isArray(uploads) ? uploads : []);
+    } catch (error) {
+      addToast(getErrorMessage(error, "Failed to load uploaded files"), "error");
+    }
+  };
+
+  useEffect(() => {
+    loadChatUploads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId]);
+
+  useEffect(() => {
+    if (!hasPendingUploads) {
+      if (chatUploadPollRef.current) {
+        window.clearInterval(chatUploadPollRef.current);
+        chatUploadPollRef.current = null;
+      }
+      return undefined;
+    }
+
+    if (!chatUploadPollRef.current) {
+      chatUploadPollRef.current = window.setInterval(async () => {
+        try {
+          const previous = Array.isArray(chatUploads) ? chatUploads : [];
+          const prevMap = new Map(previous.map((item) => [item.id, item]));
+          const latest = await listChatUploads({ thread_id: threadId || null, limit: 80 });
+          setChatUploads(Array.isArray(latest) ? latest : []);
+
+          (latest || []).forEach((item) => {
+            const before = prevMap.get(item.id);
+            if (!before) return;
+            const becameCompleted = before.status !== "completed" && item.status === "completed";
+            const becameFailed = before.status !== "failed" && item.status === "failed";
+            if (becameCompleted || becameFailed) {
+              const name = item.original_name || "Upload";
+              const title = becameCompleted ? "Upload Completed" : "Upload Failed";
+              const body = becameCompleted
+                ? `${name} is ready${item.indexed ? " and indexed" : ""}.`
+                : `${name} failed.`;
+              addToast(body, becameCompleted ? "success" : "error");
+              playCompletionSound();
+              notifyUser(title, body);
+            }
+          });
+        } catch (_) {
+          // no-op
+        }
+      }, 2000);
+    }
+
+    return () => {
+      if (chatUploadPollRef.current) {
+        window.clearInterval(chatUploadPollRef.current);
+        chatUploadPollRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasPendingUploads, threadId, chatUploads]);
+
   const openThread = async (id) => {
     if (editingThreadId === id) return; // Prevent opening while editing
     try { setLoadingMessages(true); setThreadId(id); const data = await listThreadMessages(id); setMessages(data); } 
@@ -424,7 +771,21 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
     finally { setLoadingMessages(false); }
   };
 
-  const startNewChat = () => { setThreadId(""); setMessages([]); setInput(""); setEditingThreadId(null); };
+  const startNewChat = () => {
+    setThreadId("");
+    setMessages([]);
+    setInput("");
+    setEditingThreadId(null);
+    setCanvasOpen(false);
+    setCanvasDraft("");
+    setCanvasOriginal("");
+    setCanvasThreadId("");
+    setChatUploads([]);
+    setPendingChatFiles([]);
+    setEditingQuestionIndex(null);
+    setEditingQuestionValue("");
+    setRegeneratingQuestionIndex(null);
+  };
 
   const handleDeleteThread = async (id, e) => {
     e.stopPropagation();
@@ -466,40 +827,953 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
     }
   };
 
-  const sendMessage = async () => {
-    const query = input.trim();
-    if (!query || loadingAsk) return;
+  const appendPendingChatFiles = (incoming) => {
+    const selected = Array.from(incoming || []);
+    if (selected.length === 0) return;
+    setPendingChatFiles((prev) => {
+      const map = new Map(prev.map((f) => [`${f.name}-${f.size}-${f.lastModified}`, f]));
+      selected.forEach((f) => map.set(`${f.name}-${f.size}-${f.lastModified}`, f));
+      return Array.from(map.values());
+    });
+  };
 
-    setInput("");
-    setMessages((prev) => [...prev, { role: "user", content: query }]);
-    setLoadingAsk(true);
+  const openChatFilePicker = () => {
+    const input = chatFileInputRef.current;
+    if (!input) return;
+    // Reset value so selecting the same file again still triggers onChange.
+    input.value = "";
+    input.click();
+  };
+
+  const removePendingChatFile = (target) => {
+    setPendingChatFiles((prev) =>
+      prev.filter((f) => !(f.name === target.name && f.size === target.size && f.lastModified === target.lastModified))
+    );
+  };
+
+  const handleCancelUploadedFile = async (upload) => {
+    const uploadId = String(upload?.id || "").trim();
+    if (!uploadId || chatUploadActionId) return;
+    try {
+      setChatUploadActionId(uploadId);
+      await deleteChatUpload(uploadId);
+      setChatUploads((prev) => prev.filter((item) => item.id !== uploadId));
+      const name = upload?.original_name || "File";
+      addToast(`${name} removed`, "success");
+    } catch (error) {
+      addToast(getErrorMessage(error, "Failed to cancel upload"), "error");
+    } finally {
+      setChatUploadActionId("");
+    }
+  };
+
+  const runChatUpload = async () => {
+    if (chatUploading || pendingChatFiles.length === 0) return;
+    try {
+      setChatUploading(true);
+      const res = await uploadChatFiles({
+        files: pendingChatFiles,
+        index: chatIndexEnabled,
+        thread_id: threadId || null,
+      });
+      const queued = Array.isArray(res?.queued) ? res.queued : [];
+      setChatUploads((prev) => {
+        const map = new Map(prev.map((item) => [item.id, item]));
+        queued.forEach((item) => map.set(item.id, item));
+        return Array.from(map.values());
+      });
+      setPendingChatFiles([]);
+      addToast(`Upload started: ${queued.length} file(s) in background`, "success");
+      return queued;
+    } catch (error) {
+      addToast(getErrorMessage(error, "Failed to upload files"), "error");
+      return [];
+    } finally {
+      setChatUploading(false);
+    }
+  };
+
+  const stopGeneration = () => {
+    if (askAbortRef.current) {
+      askAbortRef.current.abort();
+      askAbortRef.current = null;
+    }
+    setLoadingAsk(false);
+    addToast("Generation stopped", "success");
+  };
+
+  const buildUploadChatText = (files) => {
+    const list = Array.isArray(files) ? files : [];
+    if (list.length === 0) return "";
+    const lines = list.map((file) => `- ${file.name}`);
+    return `Uploaded document${list.length > 1 ? "s" : ""}:\n${lines.join("\n")}`;
+  };
+
+  const waitForUploadsToFinish = async (targetIds, timeoutMs = 90000, signal = null) => {
+    const ids = Array.isArray(targetIds) ? targetIds.filter(Boolean) : [];
+    if (ids.length === 0) return [];
+
+    const startedAt = Date.now();
+    let latestRows = Array.isArray(chatUploads) ? chatUploads : [];
+
+    while (Date.now() - startedAt < timeoutMs) {
+      if (signal?.aborted) return null;
+      try {
+        latestRows = await listChatUploads({ thread_id: threadId || null, limit: 80 });
+        const rows = Array.isArray(latestRows) ? latestRows : [];
+        setChatUploads(rows);
+
+        const byId = new Map(rows.map((item) => [item.id, item]));
+        const completed = ids.filter((id) => byId.get(id)?.status === "completed");
+        const failed = ids.filter((id) => byId.get(id)?.status === "failed");
+        const missing = ids.filter((id) => !byId.has(id));
+
+        if (completed.length + failed.length + missing.length >= ids.length) {
+          if (failed.length > 0) {
+            addToast("Some uploaded files failed processing and were skipped", "error");
+          }
+          return completed;
+        }
+      } catch (_) {
+        // no-op
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    }
+
+    const rows = Array.isArray(latestRows) ? latestRows : [];
+    const byId = new Map(rows.map((item) => [item.id, item]));
+    const completed = ids.filter((id) => byId.get(id)?.status === "completed");
+    addToast("Some files are still processing. Asking with available files only.", "error");
+    return completed;
+  };
+
+  const applyAssistantMessage = ({
+    assistantContent,
+    citations = [],
+    replaceAfterUserIndex = null,
+    fullContent = "",
+    canvasLinked = false,
+    agentUsed = "",
+    queryMode = "",
+    uploadIdsUsed = [],
+  }) => {
+    const nextMessage = {
+      role: "assistant",
+      content: assistantContent,
+      fullContent: fullContent || assistantContent,
+      canvasLinked: Boolean(canvasLinked),
+      agentUsed: String(agentUsed || "").trim(),
+      queryMode: String(queryMode || "").trim(),
+      uploadIdsUsed: Array.isArray(uploadIdsUsed) ? uploadIdsUsed : [],
+      citations: Array.isArray(citations) ? citations : [],
+    };
+    setMessages((prev) => {
+      if (!Number.isInteger(replaceAfterUserIndex)) {
+        return [...prev, nextMessage];
+      }
+      const updated = [...prev];
+      let targetAssistantIndex = -1;
+      for (let i = replaceAfterUserIndex + 1; i < updated.length; i += 1) {
+        if (updated[i]?.role === "assistant") {
+          targetAssistantIndex = i;
+          break;
+        }
+        if (updated[i]?.role === "user") {
+          break;
+        }
+      }
+      if (targetAssistantIndex >= 0) {
+        updated[targetAssistantIndex] = nextMessage;
+      } else {
+        updated.splice(Math.min(replaceAfterUserIndex + 1, updated.length), 0, nextMessage);
+      }
+      return updated;
+    });
+  };
+
+  const askWithQuery = async ({
+    query,
+    uploadIdsForQuestion = [],
+    askController,
+    replaceAfterUserIndex = null,
+    queryMode = "",
+    rewriteFromMessageId = "",
+    agentHint = "",
+  }) => {
+    const res = await askQuestion({
+      query,
+      thread_id: threadId || null,
+      upload_ids: uploadIdsForQuestion,
+      rewrite_from_message_id: rewriteFromMessageId || "",
+      agent_hint: agentHint || "",
+      signal: askController.signal,
+    });
+    const resolvedThreadId = threadId || res.thread_id || "";
+    if (!threadId && res.thread_id) setThreadId(res.thread_id);
+
+    const assistantContent = formatAssistantContent(res.response);
+    const shouldRouteToCanvas = countWords(assistantContent) > CHAT_CANVAS_WORD_THRESHOLD;
+    applyAssistantMessage({
+      assistantContent: shouldRouteToCanvas ? makeCanvasPreview(assistantContent) : assistantContent,
+      fullContent: assistantContent,
+      canvasLinked: shouldRouteToCanvas,
+      agentUsed: res?.agent_used || (uploadIdsForQuestion.length > 0 ? "uploaded_document_agent" : "memory_answering_agent"),
+      queryMode,
+      uploadIdsUsed: uploadIdsForQuestion,
+      citations: res.citations,
+      replaceAfterUserIndex,
+    });
+    if (shouldRouteToCanvas && resolvedThreadId) {
+      setCanvasThreadId(resolvedThreadId);
+      setCanvasOriginal(assistantContent);
+      setCanvasDraft(assistantContent);
+      setCanvasOpen(true);
+    }
+    await loadThreads();
+  };
+
+  const startEditingQuestion = (index, content) => {
+    setEditingQuestionIndex(index);
+    setEditingQuestionValue(content || "");
+  };
+
+  const cancelEditingQuestion = () => {
+    setEditingQuestionIndex(null);
+    setEditingQuestionValue("");
+  };
+
+  const copyMessageText = async (text, label = "Text") => {
+    const content = String(text || "").trim();
+    if (!content) {
+      addToast("Nothing to copy", "error");
+      return;
+    }
 
     try {
-      const res = await askQuestion({ query, thread_id: threadId || null });
-      if (!threadId && res.thread_id) setThreadId(res.thread_id);
-      setMessages((prev) => [...prev, { role: "assistant", content: formatAssistantContent(res.response), citations: Array.isArray(res.citations) ? res.citations : [] }]);
-      await loadThreads();
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = content;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "absolute";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      addToast(`${label} copied`, "success");
+    } catch (_) {
+      addToast("Failed to copy text", "error");
+    }
+  };
+
+  const findAssistantAfterUser = (messageList, userMessageIndex) => {
+    const rows = Array.isArray(messageList) ? messageList : [];
+    if (!Number.isInteger(userMessageIndex)) return null;
+    for (let i = userMessageIndex + 1; i < rows.length; i += 1) {
+      if (rows[i]?.role === "assistant") return rows[i];
+      if (rows[i]?.role === "user") break;
+    }
+    return null;
+  };
+
+  const trimConversationAfterUser = (userMessageIndex) => {
+    if (!Number.isInteger(userMessageIndex)) return;
+    setMessages((prev) => prev.slice(0, userMessageIndex + 1));
+  };
+
+  const saveEditedQuestionAndRegenerate = async (index) => {
+    const nextQuestion = editingQuestionValue.trim();
+    if (!nextQuestion) {
+      addToast("Question cannot be empty", "error");
+      return;
+    }
+    if (loadingAsk) return;
+
+    setMessages((prev) => {
+      const updated = [...prev];
+      if (updated[index]?.role === "user") {
+        updated[index] = { ...updated[index], content: nextQuestion };
+      }
+      return updated;
+    });
+    setEditingQuestionIndex(null);
+    setEditingQuestionValue("");
+    trimConversationAfterUser(index);
+    setRegeneratingQuestionIndex(index);
+    setLoadingAsk(true);
+
+    const sourceMessage = messages[index] || {};
+    const sourceAssistant = findAssistantAfterUser(messages, index);
+    const modeUsed = sourceMessage?.queryMode || sourceMessage?.chatModeUsed || chatMode;
+    const rewriteFromMessageId = String(sourceMessage?.id || "").trim();
+    const askController = new AbortController();
+    askAbortRef.current = askController;
+    try {
+      const finalQuery = buildFinalQueryByMode(nextQuestion, modeUsed);
+      const uploadIdsFromMessage = Array.isArray(sourceMessage?.uploadIdsUsed) ? sourceMessage.uploadIdsUsed : [];
+      const uploadIdsForQuestion = uploadIdsFromMessage.length > 0 ? uploadIdsFromMessage : readyUploadIds;
+      const agentHint =
+        String(sourceAssistant?.agentUsed || "").trim() ||
+        (uploadIdsForQuestion.length > 0 ? "uploaded_document_agent" : "memory_answering_agent");
+
+      setMessages((prev) => {
+        const updated = [...prev];
+        if (updated[index]?.role === "user") {
+          updated[index] = {
+            ...updated[index],
+            content: nextQuestion,
+            finalQuery,
+            queryMode: modeUsed,
+            chatModeUsed: modeUsed,
+            uploadIdsUsed: uploadIdsForQuestion,
+          };
+        }
+        return updated;
+      });
+      await askWithQuery({
+        query: finalQuery,
+        uploadIdsForQuestion,
+        askController,
+        replaceAfterUserIndex: index,
+        queryMode: modeUsed,
+        rewriteFromMessageId,
+        agentHint,
+      });
+      addToast("Answer regenerated", "success");
     } catch (error) {
+      if (error?.canceled) return;
+      applyAssistantMessage({
+        assistantContent: getErrorMessage(error, "Error generating response"),
+        fullContent: "",
+        canvasLinked: false,
+        citations: [],
+        replaceAfterUserIndex: index,
+      });
+    } finally {
+      if (askAbortRef.current === askController) {
+        askAbortRef.current = null;
+      }
+      setLoadingAsk(false);
+      setRegeneratingQuestionIndex(null);
+    }
+  };
+
+  const regenerateQuestion = async (index, originalQuestion) => {
+    const nextQuestion = String(originalQuestion || "").trim();
+    if (!nextQuestion || loadingAsk) return;
+    const sourceMessage = messages[index] || {};
+    const sourceAssistant = findAssistantAfterUser(messages, index);
+    const modeUsed = sourceMessage?.queryMode || sourceMessage?.chatModeUsed || chatMode;
+    const uploadIdsFromMessage = Array.isArray(sourceMessage?.uploadIdsUsed) ? sourceMessage.uploadIdsUsed : [];
+    const uploadIdsForQuestion = uploadIdsFromMessage.length > 0 ? uploadIdsFromMessage : readyUploadIds;
+    const rewriteFromMessageId = String(sourceMessage?.id || "").trim();
+    const agentHint =
+      String(sourceAssistant?.agentUsed || "").trim() ||
+      (uploadIdsForQuestion.length > 0 ? "uploaded_document_agent" : "memory_answering_agent");
+    trimConversationAfterUser(index);
+    setRegeneratingQuestionIndex(index);
+    setLoadingAsk(true);
+
+    const askController = new AbortController();
+    askAbortRef.current = askController;
+    try {
+      const finalQuery = buildFinalQueryByMode(nextQuestion, modeUsed);
+      setMessages((prev) => {
+        const updated = [...prev];
+        if (updated[index]?.role === "user") {
+          updated[index] = {
+            ...updated[index],
+            finalQuery,
+            queryMode: modeUsed,
+            chatModeUsed: modeUsed,
+            uploadIdsUsed: uploadIdsForQuestion,
+          };
+        }
+        return updated;
+      });
+      await askWithQuery({
+        query: finalQuery,
+        uploadIdsForQuestion,
+        askController,
+        replaceAfterUserIndex: index,
+        queryMode: modeUsed,
+        rewriteFromMessageId,
+        agentHint,
+      });
+      addToast("Answer regenerated", "success");
+    } catch (error) {
+      if (error?.canceled) return;
+      applyAssistantMessage({
+        assistantContent: getErrorMessage(error, "Error generating response"),
+        fullContent: "",
+        canvasLinked: false,
+        citations: [],
+        replaceAfterUserIndex: index,
+      });
+    } finally {
+      if (askAbortRef.current === askController) {
+        askAbortRef.current = null;
+      }
+      setLoadingAsk(false);
+      setRegeneratingQuestionIndex(null);
+    }
+  };
+
+  const sendMessage = async () => {
+    const query = input.trim();
+    const selectedFiles = Array.isArray(pendingChatFiles) ? [...pendingChatFiles] : [];
+    const hasFileSelection = selectedFiles.length > 0;
+    if (loadingAsk) return;
+    if (!query && !hasFileSelection) return;
+    const finalQuery = buildFinalQueryByMode(query, chatMode);
+    const userMessageClientId = query ? `${Date.now()}-${Math.random()}` : "";
+
+    setInput("");
+    if (hasFileSelection) {
+      const uploadMessage = buildUploadChatText(selectedFiles);
+      if (uploadMessage) {
+        setMessages((prev) => [...prev, { role: "user", content: uploadMessage, isUploadMessage: true }]);
+      }
+    }
+    if (query) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "user",
+          content: query,
+          clientId: userMessageClientId,
+          finalQuery,
+          queryMode: chatMode,
+          chatModeUsed: chatMode,
+          uploadIdsUsed: [],
+        },
+      ]);
+    }
+
+    if (!query && hasFileSelection) {
+      const queued = await runChatUpload();
+      const queuedCount = Array.isArray(queued) ? queued.length : 0;
+      if (queuedCount > 0) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: `Received ${queuedCount} uploaded file(s). Ask your question and I will answer from these documents.`,
+            citations: [],
+          },
+        ]);
+      }
+      return;
+    }
+
+    setLoadingAsk(true);
+    const askController = new AbortController();
+    askAbortRef.current = askController;
+
+    try {
+      let uploadIdsForQuestion = readyUploadIds;
+
+      if (pendingChatFiles.length > 0) {
+        const queued = await runChatUpload();
+        if (askController.signal.aborted) return;
+        const queuedIds = Array.isArray(queued) ? queued.map((item) => item?.id).filter(Boolean) : [];
+        if (queuedIds.length > 0) {
+          const completedFromQueued = await waitForUploadsToFinish(queuedIds, 90000, askController.signal);
+          if (completedFromQueued === null || askController.signal.aborted) return;
+          uploadIdsForQuestion = Array.from(new Set([...readyUploadIds, ...completedFromQueued]));
+        }
+      }
+
+      await askWithQuery({
+        query: finalQuery,
+        uploadIdsForQuestion,
+        askController,
+        queryMode: chatMode,
+      });
+      if (userMessageClientId) {
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg?.clientId === userMessageClientId
+              ? {
+                  ...msg,
+                  finalQuery,
+                  queryMode: chatMode,
+                  chatModeUsed: chatMode,
+                  uploadIdsUsed: uploadIdsForQuestion,
+                }
+              : msg
+          )
+        );
+      }
+    } catch (error) {
+      if (error?.canceled) {
+        return;
+      }
       setMessages((prev) => [...prev, { role: "assistant", content: getErrorMessage(error, "Error generating response") }]);
-    } finally { setLoadingAsk(false); }
+    } finally {
+      if (askAbortRef.current === askController) {
+        askAbortRef.current = null;
+      }
+      setLoadingAsk(false);
+    }
+  };
+
+  const saveCanvasChanges = async () => {
+    const content = canvasDraft.trim();
+    if (!canvasThreadId) {
+      addToast("Thread not found for canvas save", "error");
+      return;
+    }
+    if (!content) {
+      addToast("Canvas content cannot be empty", "error");
+      return;
+    }
+
+    setCanvasSaving(true);
+    try {
+      await saveCanvasEditApi(canvasThreadId, content);
+      setMessages((prev) => {
+        const updated = [...prev];
+        for (let i = updated.length - 1; i >= 0; i -= 1) {
+          if (updated[i]?.role === "assistant") {
+            const shouldRouteToCanvas = countWords(content) > CHAT_CANVAS_WORD_THRESHOLD;
+            updated[i] = {
+              ...updated[i],
+              content: shouldRouteToCanvas ? makeCanvasPreview(content) : content,
+              fullContent: content,
+              canvasLinked: shouldRouteToCanvas,
+            };
+            break;
+          }
+        }
+        return updated;
+      });
+      setCanvasOpen(false);
+      await loadThreads();
+      addToast("Canvas content saved to summary and memory", "success");
+    } catch (error) {
+      addToast(getErrorMessage(error, "Failed to save canvas content"), "error");
+    } finally {
+      setCanvasSaving(false);
+    }
+  };
+
+  useEffect(() => {
+    if (canvasTables.length === 0) {
+      setCanvasSelectedTableIndex(0);
+      setCanvasEditSurface("raw");
+      return;
+    }
+    if (canvasSelectedTableIndex >= canvasTables.length) {
+      setCanvasSelectedTableIndex(0);
+    }
+    if (canvasEditSurface !== "table" && canvasEditSurface !== "raw") {
+      setCanvasEditSurface("table");
+    }
+  }, [canvasTables, canvasSelectedTableIndex, canvasEditSurface]);
+
+  const updateCanvasTableAtIndex = (tableIndex, nextHeaders, nextRows) => {
+    const table = canvasTables[tableIndex];
+    if (!table) return;
+    const replacement = buildMarkdownTable(nextHeaders, nextRows);
+    setCanvasDraft((prev) => {
+      const lines = String(prev || "").replace(/\r\n/g, "\n").split("\n");
+      const before = lines.slice(0, table.startLine);
+      const after = lines.slice(table.endLine + 1);
+      return [...before, ...replacement.split("\n"), ...after].join("\n");
+    });
+  };
+
+  const updateCanvasTableCell = ({ rowIndex, colIndex, value, isHeader = false }) => {
+    const table = activeCanvasTable;
+    if (!table) return;
+    const headers = [...table.headers];
+    const rows = table.rows.map((row) => [...row]);
+
+    if (isHeader) {
+      if (!Number.isInteger(colIndex) || colIndex < 0 || colIndex >= headers.length) return;
+      headers[colIndex] = value;
+    } else {
+      if (!Number.isInteger(rowIndex) || rowIndex < 0 || rowIndex >= rows.length) return;
+      if (!Number.isInteger(colIndex) || colIndex < 0 || colIndex >= rows[rowIndex].length) return;
+      rows[rowIndex][colIndex] = value;
+    }
+
+    updateCanvasTableAtIndex(canvasSelectedTableIndex, headers, rows);
+  };
+
+  const addCanvasTableRow = () => {
+    const table = activeCanvasTable;
+    if (!table) return;
+    const headers = [...table.headers];
+    const rows = table.rows.map((row) => [...row]);
+    rows.push(Array.from({ length: headers.length }, () => ""));
+    updateCanvasTableAtIndex(canvasSelectedTableIndex, headers, rows);
+  };
+
+  const removeCanvasTableRow = (rowIndex) => {
+    const table = activeCanvasTable;
+    if (!table) return;
+    const headers = [...table.headers];
+    const rows = table.rows.map((row) => [...row]).filter((_, idx) => idx !== rowIndex);
+    updateCanvasTableAtIndex(canvasSelectedTableIndex, headers, rows);
+  };
+
+  const addCanvasTableColumn = () => {
+    const table = activeCanvasTable;
+    if (!table) return;
+    const headers = [...table.headers, `Column ${table.headers.length + 1}`];
+    const rows = table.rows.map((row) => [...row, ""]);
+    updateCanvasTableAtIndex(canvasSelectedTableIndex, headers, rows);
+  };
+
+  const removeCanvasTableColumn = (colIndex) => {
+    const table = activeCanvasTable;
+    if (!table || table.headers.length <= 1) return;
+    const headers = table.headers.filter((_, idx) => idx !== colIndex);
+    const rows = table.rows.map((row) => row.filter((_, idx) => idx !== colIndex));
+    updateCanvasTableAtIndex(canvasSelectedTableIndex, headers, rows);
+  };
+
+  const openCanvasWithContent = (content) => {
+    const normalized = stripCanvasPreviewHint(formatAssistantContent(content));
+    if (!normalized || normalized === "No response.") return;
+    if (!threadId) {
+      addToast("Open or create a thread first", "error");
+      return;
+    }
+    const detectedTables = parseMarkdownTables(normalized);
+    setCanvasThreadId(threadId);
+    setCanvasOriginal(normalized);
+    setCanvasDraft(normalized);
+    setCanvasSelectedTableIndex(0);
+    setCanvasEditSurface(detectedTables.length > 0 ? "table" : "raw");
+    setCanvasOpen(true);
+  };
+
+  const startSidebarResize = (event) => {
+    sidebarResizeRef.current = {
+      startX: event.clientX,
+      startWidth: sidebarWidth,
+    };
+    setIsResizingSidebar(true);
+  };
+
+  const closeCanvasPanel = (event) => {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    setCanvasOpen(false);
   };
 
   return (
     <div className="flex h-screen bg-[#05090f] text-slate-200 overflow-hidden font-sans selection:bg-emerald-500/30">
+      {canvasOpen && (
+        <div className="pointer-events-none fixed inset-y-0 right-0 z-[90] w-full md:w-[44rem]">
+          <button
+            type="button"
+            onPointerDown={closeCanvasPanel}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            aria-label="Close canvas"
+            title="Close canvas"
+            className="pointer-events-auto absolute left-2 top-4 z-[91] inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 bg-[#0b1016]/95 text-sm font-bold uppercase text-slate-300 shadow-lg hover:bg-slate-800 hover:text-white md:-left-4 md:top-4 transition-colors"
+          >
+            x
+          </button>
+          <div className="pointer-events-auto absolute inset-y-0 right-0 w-full border-l border-slate-700/60 bg-[#0b1016]/95 shadow-2xl backdrop-blur-xl">
+            <div className="flex h-full flex-col">
+              <div className="flex items-center border-b border-slate-800 px-5 py-4">
+                <div>
+                  <div className="text-sm font-bold text-white">Canvas</div>
+                  <div className="text-xs text-slate-400">Edit and preview rich formatting</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between border-b border-slate-800/80 px-5 py-3">
+                <div className="text-xs text-slate-500">Words: {countWords(canvasDraft)}</div>
+                <div className="flex items-center gap-2">
+                  {canvasView === "edit" && canvasTables.length > 0 && (
+                    <div className="inline-flex rounded-lg border border-slate-700/80 bg-slate-900/60 p-0.5">
+                      {[
+                        { key: "table", label: "Table" },
+                        { key: "raw", label: "Markdown" },
+                      ].map((mode) => (
+                        <button
+                          key={mode.key}
+                          type="button"
+                          onClick={() => setCanvasEditSurface(mode.key)}
+                          className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                            canvasEditSurface === mode.key
+                              ? "bg-cyan-600 text-white"
+                              : "text-slate-300 hover:bg-slate-800 hover:text-white"
+                          }`}
+                        >
+                          {mode.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="inline-flex rounded-lg border border-slate-700/80 bg-slate-900/60 p-0.5">
+                    {["edit", "preview", "split"].map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setCanvasView(mode)}
+                        className={`rounded-md px-2.5 py-1 text-[11px] font-semibold capitalize transition-colors ${
+                          canvasView === mode
+                            ? "bg-emerald-600 text-white"
+                            : "text-slate-300 hover:bg-slate-800 hover:text-white"
+                        }`}
+                      >
+                        {mode}
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setCanvasDraft(canvasOriginal)}
+                    disabled={canvasSaving}
+                    className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    Revert
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveCanvasChanges}
+                    disabled={canvasSaving}
+                    className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {canvasSaving ? "Saving..." : "Save"}
+                  </button>
+                </div>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto p-5 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-slate-700/90 hover:[&::-webkit-scrollbar-thumb]:bg-slate-600">
+                {canvasView === "split" ? (
+                  <div className="grid h-full grid-cols-1 gap-4 lg:grid-cols-2">
+                    <textarea
+                      value={canvasDraft}
+                      onChange={(e) => setCanvasDraft(e.target.value)}
+                      className="h-full min-h-[220px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/70 p-5 text-sm leading-relaxed text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                    />
+                    <div className="h-full min-h-[220px] overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
+                      <div className="w-full text-[14px] leading-relaxed text-slate-200 
+                        [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
+                        [&_p]:mb-4 
+                        [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
+                        [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
+                        [&_li::marker]:text-emerald-500 [&_li]:pl-1 
+                        [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
+                        [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
+                        [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
+                        [&_a]:text-cyan-400 [&_a]:underline hover:[&_a]:text-cyan-300 
+                        [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
+                        [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
+                        [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
+                        [&_table]:my-4 [&_table]:w-full [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-sm
+                        [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
+                        [&_tr]:border-b [&_tr]:border-slate-800/80
+                        [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top
+                        [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2 [&_td]:text-slate-300 [&_td]:align-top
+                        [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto
+                        [&_strong]:font-bold [&_strong]:text-white
+                      ">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatAssistantContent(canvasDraft)}</ReactMarkdown>
+                      </div>
+                    </div>
+                  </div>
+                ) : canvasView === "preview" ? (
+                  <div className="h-full overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
+                    <div className="w-full text-[14px] leading-relaxed text-slate-200 
+                      [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
+                      [&_p]:mb-4 
+                      [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
+                      [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
+                      [&_li::marker]:text-emerald-500 [&_li]:pl-1 
+                      [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
+                      [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
+                      [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
+                      [&_a]:text-cyan-400 [&_a]:underline hover:[&_a]:text-cyan-300 
+                      [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
+                      [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
+                      [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
+                      [&_table]:my-4 [&_table]:w-full [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-sm
+                      [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
+                      [&_tr]:border-b [&_tr]:border-slate-800/80
+                      [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top
+                      [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2 [&_td]:text-slate-300 [&_td]:align-top
+                      [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto
+                      [&_strong]:font-bold [&_strong]:text-white
+                    ">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatAssistantContent(canvasDraft)}</ReactMarkdown>
+                    </div>
+                  </div>
+                ) : (
+                  canvasEditSurface === "table" && activeCanvasTable ? (
+                    <div className="h-full rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-xs text-slate-400">
+                          <span className="rounded-md border border-slate-700/70 bg-slate-900/70 px-2 py-1">
+                            Table {canvasSelectedTableIndex + 1} of {canvasTables.length}
+                          </span>
+                          {canvasTables.length > 1 && (
+                            <select
+                              value={canvasSelectedTableIndex}
+                              onChange={(e) => setCanvasSelectedTableIndex(Number(e.target.value))}
+                              className="rounded-md border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                            >
+                              {canvasTables.map((_, idx) => (
+                                <option key={`table-opt-${idx}`} value={idx}>
+                                  Table {idx + 1}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={addCanvasTableColumn}
+                            className="rounded-md border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-800"
+                          >
+                            Add Column
+                          </button>
+                          <button
+                            type="button"
+                            onClick={addCanvasTableRow}
+                            className="rounded-md border border-slate-700 bg-slate-900/80 px-2 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-800"
+                          >
+                            Add Row
+                          </button>
+                        </div>
+                      </div>
+                      <div className="h-[calc(100%-3rem)] overflow-auto rounded-xl border border-slate-800/80">
+                        <table className="min-w-full border-collapse text-left text-sm">
+                          <thead className="bg-slate-900/80">
+                            <tr>
+                              {activeCanvasTable.headers.map((header, colIdx) => (
+                                <th key={`th-${colIdx}`} className="border border-slate-700/90 p-2 align-top">
+                                  <div className="flex items-start gap-1.5">
+                                    <input
+                                      value={header}
+                                      onChange={(e) =>
+                                        updateCanvasTableCell({
+                                          rowIndex: -1,
+                                          colIndex: colIdx,
+                                          value: e.target.value,
+                                          isHeader: true,
+                                        })
+                                      }
+                                      className="w-full rounded-md border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs font-semibold text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => removeCanvasTableColumn(colIdx)}
+                                      disabled={activeCanvasTable.headers.length <= 1}
+                                      className="rounded-md border border-slate-700 bg-slate-900/80 px-1.5 py-1 text-[10px] font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-40"
+                                      title="Remove column"
+                                    >
+                                      -
+                                    </button>
+                                  </div>
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {activeCanvasTable.rows.map((row, rowIdx) => (
+                              <tr key={`row-${rowIdx}`} className="border-b border-slate-800/80">
+                                {row.map((cell, colIdx) => (
+                                  <td key={`td-${rowIdx}-${colIdx}`} className="border border-slate-700/90 p-2 align-top">
+                                    <div className="flex items-start gap-1.5">
+                                      <input
+                                        value={cell}
+                                        onChange={(e) =>
+                                          updateCanvasTableCell({
+                                            rowIndex: rowIdx,
+                                            colIndex: colIdx,
+                                            value: e.target.value,
+                                            isHeader: false,
+                                          })
+                                        }
+                                        className="w-full rounded-md border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                                      />
+                                      {colIdx === row.length - 1 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => removeCanvasTableRow(rowIdx)}
+                                          className="rounded-md border border-slate-700 bg-slate-900/80 px-1.5 py-1 text-[10px] font-semibold text-slate-300 hover:bg-slate-800"
+                                          title="Remove row"
+                                        >
+                                          -
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ) : (
+                    <textarea
+                      value={canvasDraft}
+                      onChange={(e) => setCanvasDraft(e.target.value)}
+                      className="h-full w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/70 p-5 text-sm leading-relaxed text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
+                    />
+                  )
+                )}
+              </div>
+              <div className="border-t border-slate-800 px-5 py-3 text-[11px] text-slate-500">
+                This saves edited text into the latest assistant response, thread summary, and memory.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="absolute inset-0 pointer-events-none overflow-hidden z-0">
         <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-emerald-500/5 blur-[120px] rounded-full mix-blend-screen animate-pulse duration-[8000ms]" />
         <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-cyan-500/5 blur-[120px] rounded-full mix-blend-screen animate-pulse duration-[10000ms]" />
       </div>
       
       {/* Sidebar */}
-      <aside className="relative z-20 hidden w-[300px] flex-col border-r border-slate-800/60 bg-[#0b1016]/80 md:flex backdrop-blur-2xl shadow-xl">
+      {!isSidebarCollapsed && (
+      <aside
+        className="relative z-20 hidden flex-col border-r border-slate-800/60 bg-[#0b1016]/80 md:flex backdrop-blur-2xl shadow-xl"
+        style={{ width: `${sidebarWidth}px` }}
+      >
         <div className="p-6 flex flex-col gap-2 border-b border-slate-800/40 shrink-0">
           <div className="text-[10px] font-bold uppercase tracking-[0.3em] text-emerald-400 drop-shadow-[0_0_8px_rgba(16,185,129,0.5)]">Smart Medirag</div>
           <div className="flex items-center justify-between mt-1">
             <span className="text-sm font-bold text-slate-100">Conversations</span>
-            <span className="inline-flex items-center rounded-md bg-slate-800/80 px-2 py-1 text-[10px] font-bold text-slate-300 ring-1 ring-inset ring-slate-700 uppercase tracking-widest shadow-inner">
-              {user?.role || "user"}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center rounded-md bg-slate-800/80 px-2 py-1 text-[10px] font-bold text-slate-300 ring-1 ring-inset ring-slate-700 uppercase tracking-widest shadow-inner">
+                {user?.role || "user"}
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsSidebarCollapsed(true)}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-700/70 bg-slate-900/70 text-slate-300 hover:bg-slate-800 hover:text-white transition-colors"
+                title="Close conversations panel"
+                aria-label="Close conversations panel"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="m15 6-6 6 6 6" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
 
@@ -598,10 +1872,99 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
             Sign Out
           </button>
         </div>
+        <div
+          onMouseDown={startSidebarResize}
+          className={`absolute right-0 top-0 h-full w-1.5 translate-x-1/2 cursor-col-resize bg-transparent ${
+            isResizingSidebar ? "after:bg-cyan-400/70" : "after:bg-cyan-500/35 hover:after:bg-cyan-400/60"
+          } after:absolute after:inset-y-0 after:left-1/2 after:w-px`}
+          title="Drag to resize conversations panel"
+          aria-label="Resize conversations panel"
+        />
       </aside>
+      )}
 
       {/* Main Chat Area */}
-      <main className="flex flex-1 flex-col h-full w-full relative z-10 bg-[#05090f]/50">
+      <main
+        className={`flex flex-1 flex-col h-full w-full relative z-10 ${canvasOpen ? "md:mr-[44rem]" : ""} ${theme === "light" ? "bg-slate-100/70" : "bg-[#05090f]/50"}`}
+      >
+        {isSidebarCollapsed && (
+          <button
+            type="button"
+            onClick={() => setIsSidebarCollapsed(false)}
+            className="hidden md:inline-flex absolute left-4 top-4 z-30 h-9 items-center gap-2 rounded-xl border border-slate-700/70 bg-[#0b1016]/90 px-3 text-xs font-semibold text-slate-200 shadow-lg backdrop-blur-xl hover:bg-slate-800/90"
+            title="Open conversations panel"
+            aria-label="Open conversations panel"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="m9 6 6 6-6 6" />
+            </svg>
+            Conversations
+          </button>
+        )}
+        <div className={`absolute left-4 top-16 z-30 md:top-4 ${isSidebarCollapsed ? "md:left-52" : "md:left-4"}`}>
+          <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-slate-700/60 bg-[#0b1016]/90 p-2 shadow-xl backdrop-blur-xl">
+            <button
+              type="button"
+              onClick={() => setChatIndexEnabled((prev) => !prev)}
+              className={`inline-flex h-9 min-w-9 items-center justify-center rounded-xl border transition-all ${
+                chatIndexEnabled
+                  ? "border-emerald-500/60 bg-emerald-500/20 text-emerald-200 shadow-[0_0_20px_rgba(16,185,129,0.25)]"
+                  : "border-slate-700/80 bg-slate-900/80 text-slate-300 hover:border-slate-500/80 hover:bg-slate-800/90 hover:text-white"
+              }`}
+              title="Index"
+              aria-label="Index"
+            >
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.1} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
+              </svg>
+            </button>
+            <div className="inline-flex items-center rounded-xl border border-slate-700/80 bg-slate-900/80 p-0.5">
+              <button
+                type="button"
+                onClick={() => setChatMode("fast")}
+                className={`inline-flex h-8 items-center gap-1 rounded-lg px-3 py-1 text-[10px] font-bold tracking-wide transition-all ${
+                  chatMode === "fast"
+                    ? "bg-slate-700/80 text-white"
+                    : "text-slate-300 hover:text-white"
+                }`}
+                title="FAST"
+                aria-label="FAST mode"
+              >
+                <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z" />
+                </svg>
+                FAST
+              </button>
+              <button
+                type="button"
+                onClick={() => setChatMode("pro")}
+                className={`inline-flex h-8 items-center gap-1 rounded-lg px-3 py-1 text-[10px] font-bold tracking-wide transition-all ${
+                  chatMode === "pro"
+                    ? "bg-cyan-500/80 text-white"
+                    : "text-slate-300 hover:text-white"
+                }`}
+                title="PRO"
+                aria-label="PRO mode"
+              >
+                <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.1} d="m12 3 2.8 5.67 6.2.9-4.5 4.38 1.06 6.19L12 17.2 6.44 20.14 7.5 13.95 3 9.57l6.2-.9L12 3Z" />
+                </svg>
+                PRO
+              </button>
+            </div>
+            <input
+              ref={chatFileInputRef}
+              type="file"
+              multiple
+              accept=".pdf,.txt,.md,.docx,image/*"
+              className="hidden"
+              onChange={(e) => {
+                appendPendingChatFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+          </div>
+        </div>
         
         {/* Mobile Header */}
         <header className="flex items-center justify-between border-b border-slate-800/60 bg-[#0b1016]/80 px-4 py-3 backdrop-blur-xl md:hidden z-20 shadow-sm">
@@ -633,7 +1996,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
         </header>
 
         {/* Messages List */}
-        <div className="flex-1 overflow-y-auto w-full scroll-smooth [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:bg-slate-800/80 [&::-webkit-scrollbar-thumb]:rounded-full pt-4">
+        <div className="flex-1 overflow-y-auto w-full scroll-smooth [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:bg-slate-800/80 [&::-webkit-scrollbar-thumb]:rounded-full pt-20 md:pt-16">
           <div className="mx-auto w-full max-w-4xl px-4 md:px-8 pb-32 flex flex-col gap-8">
             {messages.length === 0 && !loadingMessages && (
               <div className="flex flex-col items-center justify-center py-32 text-center animate-in fade-in zoom-in-[0.98] duration-700 ease-out">
@@ -667,41 +2030,170 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
 
             {messages.map((msg, index) => {
               const isUser = msg.role === "user";
+              const isUploadMessage = Boolean(msg.isUploadMessage);
+              const isEditingThisQuestion = isUser && !isUploadMessage && editingQuestionIndex === index;
+              const assistantBubbleWidthClass = isUser
+                ? "max-w-[92%] md:max-w-[85%]"
+                : canvasOpen
+                ? "max-w-[96%] md:max-w-[95%]"
+                : "max-w-[92%] md:max-w-[85%]";
+              const assistantSourceContent = msg.fullContent || msg.content || "";
+              const assistantNeedsCanvasPreview =
+                Boolean(msg.canvasLinked) ||
+                String(assistantSourceContent).includes(CHAT_CANVAS_PREVIEW_HINT) ||
+                countWords(assistantSourceContent) > CHAT_CANVAS_WORD_THRESHOLD;
+              const assistantRenderContent = assistantNeedsCanvasPreview
+                ? makeCanvasPreview(assistantSourceContent, CHAT_CANVAS_PREVIEW_WORDS)
+                : formatAssistantContent(assistantSourceContent);
               return (
-                <div key={`${msg.id || index}-${msg.role}`} className={`flex w-full ${isUser ? "justify-end" : "justify-start"} animate-in slide-in-from-bottom-6 fade-in duration-500 ease-out fill-mode-both`}>
-                  <div 
-                    className={`relative max-w-[92%] md:max-w-[85%] rounded-[2rem] px-6 py-5 shadow-2xl ${
-                      isUser 
-                        ? "bg-gradient-to-br from-emerald-500 to-teal-600 text-white rounded-tr-sm shadow-[0_10px_30px_rgba(16,185,129,0.2)] border border-emerald-400/30" 
-                        : "bg-[#0b1016]/95 border border-slate-700/60 text-slate-200 rounded-tl-sm backdrop-blur-xl shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
-                    }`}
-                  >
-                    {!isUser && (
-                       <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-500/30 to-transparent rounded-t-[2rem]"></div>
-                    )}
-
-                    {isUser ? (
-                      <div className="whitespace-pre-wrap leading-relaxed text-[15px] font-medium">{msg.content}</div>
-                    ) : (
-                      <div className="flex flex-col gap-2 w-full overflow-hidden">
-                        <div className="w-full text-[15px] leading-relaxed text-slate-200 
-                          [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
-                          [&_p]:mb-4 
-                          [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
-                          [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
-                          [&_li::marker]:text-emerald-500 [&_li]:pl-1 
-                          [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
-                          [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
-                          [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
-                          [&_a]:text-cyan-400 [&_a]:underline hover:[&_a]:text-cyan-300 
-                          [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
-                          [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
-                          [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
-                          [&_strong]:font-bold [&_strong]:text-white
-                        ">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatAssistantContent(msg.content)}</ReactMarkdown>
+                <div key={`${msg.id || index}-${msg.role}`} className={`group/msg message-pop flex w-full ${isUser ? "justify-end" : "justify-start"} animate-in slide-in-from-bottom-6 fade-in duration-500 ease-out fill-mode-both`}>
+                  <div className={`flex ${assistantBubbleWidthClass} flex-col ${isUser ? "items-end" : "items-start"}`}>
+                    <div
+                      className={`relative rounded-[2rem] shadow-2xl ${
+                      isUser
+                        ? isUploadMessage
+                          ? "px-6 py-5 bg-slate-900/95 text-slate-100 rounded-tr-sm shadow-[0_10px_30px_rgba(15,23,42,0.45)] border border-cyan-500/35"
+                          : "px-6 py-5 bg-gradient-to-br from-emerald-500 to-teal-600 text-white rounded-tr-sm shadow-[0_10px_30px_rgba(16,185,129,0.2)] border border-emerald-400/30"
+                        : `${canvasOpen ? "px-4 py-4" : "px-6 py-5"} bg-[#0b1016]/95 border border-slate-700/60 text-slate-200 rounded-tl-sm backdrop-blur-xl shadow-[0_10px_40px_rgba(0,0,0,0.4)]`
+                      }`}
+                    >
+                      {isUploadMessage && (
+                        <div className="absolute top-2.5 left-4 inline-flex items-center gap-1 rounded-md border border-cyan-500/40 bg-cyan-500/12 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cyan-200">
+                          Document Upload
                         </div>
-                        <CitationBox citations={msg.citations} />
+                      )}
+                      {!isUser && (
+                        <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-500/30 to-transparent rounded-t-[2rem]"></div>
+                      )}
+
+                      {isUser ? (
+                        <div className={`${isUploadMessage ? "pt-6" : ""}`}>
+                          {isEditingThisQuestion ? (
+                            <div className="space-y-2.5">
+                              <textarea
+                                rows={3}
+                                value={editingQuestionValue}
+                                onChange={(event) => setEditingQuestionValue(event.target.value)}
+                                className="w-full resize-y rounded-xl border border-emerald-200/40 bg-emerald-100/10 px-3 py-2 text-[14px] text-white placeholder:text-emerald-100/70 focus:outline-none focus:ring-2 focus:ring-emerald-300/40"
+                                aria-label="Edit question"
+                              />
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={cancelEditingQuestion}
+                                  disabled={loadingAsk}
+                                  className="rounded-lg border border-emerald-100/35 bg-emerald-100/10 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-50 hover:bg-emerald-100/20 disabled:opacity-50"
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => saveEditedQuestionAndRegenerate(index)}
+                                  disabled={loadingAsk || !editingQuestionValue.trim()}
+                                  className="rounded-lg border border-white/35 bg-white/20 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-white/30 disabled:opacity-50"
+                                >
+                                  Save + Regenerate
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="whitespace-pre-wrap leading-relaxed text-[15px] font-medium">{msg.content}</div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="flex flex-col gap-2 w-full overflow-hidden">
+                          <div className={`w-full overflow-x-auto text-[15px] leading-relaxed text-slate-200 
+                            [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
+                            [&_p]:mb-4 
+                            [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
+                            [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
+                            [&_li::marker]:text-emerald-500 [&_li]:pl-1 
+                            [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
+                            [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
+                            [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
+                            [&_a]:text-cyan-400 [&_a]:underline hover:[&_a]:text-cyan-300 
+                            [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
+                            [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
+                            [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
+                            [&_table]:my-4 [&_table]:w-full [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-sm
+                            [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
+                            [&_tr]:border-b [&_tr]:border-slate-800/80
+                            [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
+                            [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2 [&_td]:text-slate-300 [&_td]:align-top [&_td]:whitespace-normal [&_td]:break-words
+                            [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto
+                            [&_strong]:font-bold [&_strong]:text-white
+                            ${
+                              canvasOpen
+                                ? "[&_table]:w-full [&_table]:table-fixed [&_table]:text-xs [&_th]:px-2 [&_th]:py-1.5 [&_td]:px-2 [&_td]:py-1.5"
+                                : ""
+                            }
+                          `}>
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{assistantRenderContent}</ReactMarkdown>
+                          </div>
+                          {assistantNeedsCanvasPreview && (
+                            <div className="mb-1 flex items-center justify-end">
+                              <button
+                                type="button"
+                                onClick={() => openCanvasWithContent(assistantSourceContent)}
+                                className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 py-1 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 hover:text-cyan-200 transition-colors"
+                              >
+                                Open in Canvas
+                              </button>
+                            </div>
+                          )}
+                          <CitationBox citations={msg.citations} addToast={addToast} />
+                        </div>
+                      )}
+                    </div>
+
+                    {!isEditingThisQuestion && (
+                      <div
+                        className={`mt-2 flex items-center gap-2 opacity-0 pointer-events-none transition-opacity duration-200 group-hover/msg:opacity-100 group-hover/msg:pointer-events-auto group-focus-within/msg:opacity-100 group-focus-within/msg:pointer-events-auto ${isUser ? "justify-end" : "justify-start"}`}
+                      >
+                        {isUser && !isUploadMessage && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => startEditingQuestion(index, msg.content)}
+                              disabled={loadingAsk}
+                              title="Edit question"
+                              aria-label="Edit question"
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/25 bg-white/10 text-white/90 hover:bg-white/20 disabled:opacity-50"
+                            >
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5h2m-7.172 14.172a4 4 0 0 1 0-5.657L14.343 5a2 2 0 0 1 2.828 0l1.829 1.829a2 2 0 0 1 0 2.828l-8.515 8.515a4 4 0 0 1-1.657 1L5 20l.828-3.828Z" />
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => regenerateQuestion(index, msg.content)}
+                              disabled={loadingAsk}
+                              title="Regenerate answer"
+                              aria-label="Regenerate answer"
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/25 bg-white/10 text-white/90 hover:bg-white/20 disabled:opacity-50"
+                            >
+                              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582M20 20v-5h-.581M5.063 19A9 9 0 0 0 20 12.94M18.937 5A9 9 0 0 0 4 11.06" />
+                              </svg>
+                            </button>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => copyMessageText(isUser ? msg.content : (msg.fullContent || msg.content), isUser ? "Question" : "Response")}
+                          title={isUser ? "Copy question text" : "Copy response text"}
+                          aria-label={isUser ? "Copy question text" : "Copy response text"}
+                          className={`inline-flex h-8 w-8 items-center justify-center rounded-full border ${
+                            isUser
+                              ? "border-white/25 bg-white/10 text-white/90 hover:bg-white/20"
+                              : "border-slate-600/70 bg-slate-900/50 text-slate-300 hover:bg-slate-800/70"
+                          }`}
+                        >
+                          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2V7Z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 9a2 2 0 0 1 2-2h1m-3 8V9a2 2 0 0 1 2-2h1" />
+                          </svg>
+                        </button>
                       </div>
                     )}
                   </div>
@@ -713,9 +2205,12 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
               <div className="flex justify-start animate-in fade-in zoom-in-[0.98] duration-300 ease-out">
                 <div className="bg-[#0b1016]/95 border border-slate-700/60 text-slate-400 rounded-[2rem] rounded-tl-sm px-6 py-5 flex items-center gap-2.5 shadow-[0_10px_40px_rgba(0,0,0,0.4)] backdrop-blur-xl relative">
                   <div className="absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-cyan-500/20 to-transparent rounded-t-[2rem]" />
-                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-bounce shadow-[0_0_8px_rgba(16,185,129,0.8)]" style={{ animationDelay: "0ms" }} />
-                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-bounce shadow-[0_0_8px_rgba(16,185,129,0.8)]" style={{ animationDelay: "150ms" }} />
-                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-bounce shadow-[0_0_8px_rgba(16,185,129,0.8)]" style={{ animationDelay: "300ms" }} />
+                  <div className="typing-dot" style={{ animationDelay: "0ms" }} />
+                  <div className="typing-dot" style={{ animationDelay: "150ms" }} />
+                  <div className="typing-dot" style={{ animationDelay: "300ms" }} />
+                  {Number.isInteger(regeneratingQuestionIndex) && (
+                    <span className="ml-1 text-xs text-slate-300">Regenerating answer...</span>
+                  )}
                 </div>
               </div>
             )}
@@ -724,38 +2219,133 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin }) {
         </div>
 
         {/* Input Area */}
-        <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-[#05090f] via-[#05090f] to-transparent pt-16 pb-8 px-4 z-20 pointer-events-none">
+        <div className={`absolute bottom-0 left-0 right-0 pt-16 pb-8 px-4 z-20 pointer-events-none ${
+          theme === "light"
+            ? "bg-gradient-to-t from-slate-100/95 via-slate-100/80 to-transparent"
+            : "bg-gradient-to-t from-[#05090f] via-[#05090f] to-transparent"
+        }`}>
           <div className="mx-auto max-w-4xl relative group pointer-events-auto">
-            <div className="absolute -inset-1 bg-gradient-to-r from-emerald-500/20 to-cyan-500/20 rounded-[2.5rem] blur-xl opacity-50 group-focus-within:opacity-100 transition duration-500" />
-            
-            <div className="relative flex items-end rounded-[2rem] border border-slate-700/60 bg-[#0b1016]/95 p-2 pr-20 shadow-2xl backdrop-blur-2xl focus-within:border-emerald-500/50 focus-within:ring-2 focus-within:ring-emerald-500/20 transition-all duration-300">
-              <textarea
-                rows={1}
-                value={input}
-                onChange={(e) => {
-                  setInput(e.target.value);
-                  e.target.style.height = 'auto';
-                  e.target.style.height = `${Math.min(e.target.scrollHeight, 240)}px`;
-                }}
-                placeholder="Ask your medical knowledge base..."
-                className="flex-1 max-h-[240px] min-h-[52px] resize-none bg-transparent px-5 py-3.5 text-[15px] font-medium text-slate-100 placeholder:text-slate-500 focus:outline-none [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-slate-700 [&::-webkit-scrollbar-thumb]:rounded-full leading-relaxed"
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    sendMessage();
-                    event.target.style.height = 'auto';
-                  }
-                }}
-              />
-              <button 
-                onClick={sendMessage} 
-                disabled={loadingAsk || !input.trim()} 
-                className="absolute bottom-3 right-3 p-3.5 rounded-[1.25rem] bg-gradient-to-br from-emerald-400 to-emerald-600 text-white shadow-[0_4px_15px_rgba(16,185,129,0.3)] hover:shadow-[0_6px_25px_rgba(16,185,129,0.5)] transition-all duration-300 disabled:opacity-30 disabled:hover:shadow-none active:scale-95 group/btn"
-              >
-                <svg className="w-5 h-5 group-hover/btn:-translate-y-1 group-hover/btn:translate-x-1 transition-transform duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 19V5m0 0l-7 7m7-7l7 7" />
-                </svg>
-              </button>
+            <div className="input-shell relative rounded-[1.35rem] border border-slate-700/70 bg-[#0b1016]/95 px-3 py-2.5 shadow-2xl backdrop-blur-2xl focus-within:border-emerald-500/50 focus-within:ring-2 focus-within:ring-emerald-500/20 transition-all duration-300">
+              {(pendingChatFiles.length > 0 || chatUploads.length > 0) && (
+                <div className="mb-2 space-y-2 rounded-xl border border-slate-700/50 bg-slate-900/40 px-3 py-2">
+                  {pendingChatFiles.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      {pendingChatFiles.map((file) => (
+                        <div key={`${file.name}-${file.size}-${file.lastModified}`} className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-800/80 px-2 py-1 text-slate-300">
+                          <span className="max-w-[180px] truncate">{file.name}</span>
+                          <button type="button" className="text-slate-400 hover:text-rose-300" onClick={() => removePendingChatFile(file)} title="Remove file">x</button>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => setPendingChatFiles([])}
+                        disabled={chatUploading}
+                        className="rounded-md border border-slate-600/70 bg-slate-800/70 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-700/80 disabled:opacity-50"
+                      >
+                        Clear
+                      </button>
+                      <button
+                        type="button"
+                        onClick={runChatUpload}
+                        disabled={chatUploading}
+                        className="rounded-md border border-cyan-500/40 bg-cyan-500/20 px-2 py-1 text-[11px] text-cyan-200 hover:bg-cyan-500/30 disabled:opacity-50"
+                      >
+                        {chatUploading ? "Uploading..." : "Upload"}
+                      </button>
+                    </div>
+                  )}
+                  {chatUploads.length > 0 && (
+                    <div className="flex flex-wrap gap-2 text-[11px]">
+                      {chatUploads.slice(0, 8).map((item) => {
+                        const isActing = chatUploadActionId === item.id;
+                        return (
+                          <span
+                            key={item.id}
+                            className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 ${
+                              item.status === "completed"
+                                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                                : item.status === "failed"
+                                ? "border-rose-500/40 bg-rose-500/10 text-rose-200"
+                                : "border-slate-700 bg-slate-900/70 text-slate-300"
+                            }`}
+                            title={item.error_message || item.original_name}
+                          >
+                            <span className="max-w-[220px] truncate">{item.original_name} - {item.status}{item.indexed ? " (indexed)" : ""}</span>
+                            <button
+                              type="button"
+                              onClick={() => handleCancelUploadedFile(item)}
+                              disabled={isActing}
+                              className="rounded border border-slate-500/50 bg-slate-950/40 px-1.5 py-0.5 text-[10px] font-semibold text-slate-200 hover:border-slate-300/70 hover:text-white disabled:opacity-50"
+                            >
+                              {isActing ? "..." : "Remove"}
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="flex items-end gap-2">
+                <button
+                  type="button"
+                  onClick={openChatFilePicker}
+                  className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-slate-700/80 bg-slate-900/80 text-slate-200 hover:border-cyan-500/60 hover:bg-slate-800/90 hover:text-cyan-200 transition-all"
+                  title="Upload files"
+                  aria-label="Upload files"
+                >
+                  <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.1} d="M15.172 7.172a4 4 0 0 0-5.657 0L6.343 10.344a4 4 0 1 0 5.657 5.656l4.243-4.242a2.5 2.5 0 0 0-3.536-3.536l-4.95 4.95" />
+                  </svg>
+                </button>
+                <textarea
+                  rows={1}
+                  value={input}
+                  onChange={(e) => {
+                    setInput(e.target.value);
+                    e.target.style.height = 'auto';
+                    e.target.style.height = `${Math.min(e.target.scrollHeight, 240)}px`;
+                  }}
+                  placeholder="Message Smart Medirag..."
+                  aria-label="Ask a medical document question"
+                  className={`flex-1 max-h-[240px] min-h-[42px] resize-none bg-transparent px-1 py-2 text-[15px] font-medium focus:outline-none [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full leading-relaxed ${
+                    theme === "light"
+                      ? "text-slate-800 placeholder:text-slate-400 [&::-webkit-scrollbar-thumb]:bg-slate-300"
+                      : "text-slate-100 placeholder:text-slate-500 [&::-webkit-scrollbar-thumb]:bg-slate-700"
+                  }`}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      sendMessage();
+                      event.target.style.height = 'auto';
+                    }
+                  }}
+                />
+                <button
+                  onClick={loadingAsk ? stopGeneration : sendMessage}
+                  disabled={!loadingAsk && (!input.trim() && pendingChatFiles.length === 0)}
+                  className={`inline-flex h-11 w-11 items-center justify-center rounded-xl text-white shadow-[0_4px_15px_rgba(16,185,129,0.3)] transition-all duration-300 disabled:opacity-30 disabled:hover:shadow-none active:scale-95 group/btn ${
+                    loadingAsk
+                      ? "bg-gradient-to-br from-rose-500 to-rose-700 hover:shadow-[0_6px_25px_rgba(244,63,94,0.35)]"
+                      : "bg-gradient-to-br from-emerald-400 to-emerald-600 hover:shadow-[0_6px_25px_rgba(16,185,129,0.4)]"
+                  }`}
+                  title={loadingAsk ? "Stop" : "Send"}
+                >
+                  {loadingAsk ? (
+                    <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
+                      <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                    </svg>
+                  ) : (
+                    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="m5 12 14-7-4 7 4 7-14-7Z" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] font-medium text-slate-400">
+                <span>Enter to send | Shift + Enter for a new line</span>
+                {loadingAsk && <span className="text-rose-300">Generating... tap stop to cancel</span>}
+              </div>
             </div>
             
             <div className="text-center mt-3 text-[11px] font-bold text-slate-500 tracking-wide uppercase opacity-70">
@@ -904,6 +2494,11 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
       await loadDocuments();
       await loadAdminStatistics();
       addToast(`Ingestion finished: ${response.ingested_count || 0} success, ${response.failed_count || 0} failed`, "success");
+      playCompletionSound();
+      notifyUser(
+        "Admin Ingestion Completed",
+        `${response.ingested_count || 0} indexed, ${response.failed_count || 0} failed.`
+      );
       if ((response.failed_count || 0) === 0) setFiles([]);
       setCompletionResult(response);
       setShowCompletionPopup(true);
@@ -911,6 +2506,8 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
     } catch (error) {
       clearIngestionProgressTimer();
       addToast(getErrorMessage(error, "Ingestion failed"), "error");
+      playCompletionSound();
+      notifyUser("Admin Ingestion Failed", getErrorMessage(error, "Ingestion failed"));
     } 
     finally {
       setUploading(false);
@@ -1563,6 +3160,7 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [toasts, setToasts] = useState([]);
   const [route, setRoute] = useState(() => getCurrentRoute());
+  const [theme, setTheme] = useState(() => getInitialTheme());
 
   const addToast = (message, type = "success") => {
     const id = `${Date.now()}-${Math.random()}`;
@@ -1599,6 +3197,10 @@ export default function App() {
   }, [token]);
 
   useEffect(() => { if (!window.location.hash) { window.location.hash = "#/chat"; setRoute("#/chat"); } }, []);
+  useEffect(() => {
+    applyTheme(theme);
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   const handleLogout = () => {
     clearSession();
@@ -1620,6 +3222,7 @@ export default function App() {
   return (
     <>
       <Toasts items={toasts} />
+      <ThemeToggle theme={theme} onToggle={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))} />
       {isAdminLoginRoute ? (
         <AdminLoginPanel
           addToast={addToast}
@@ -1635,9 +3238,10 @@ export default function App() {
           <AccessDeniedPanel onBackToChat={() => navigate("#/chat")} onLogout={handleLogout} />
         )
       ) : (
-        <ChatPanel onLogout={handleLogout} addToast={addToast} user={user} onOpenAdmin={() => navigate("#/admin/login")} />
+        <ChatPanel onLogout={handleLogout} addToast={addToast} user={user} onOpenAdmin={() => navigate("#/admin/login")} theme={theme} />
       )}
     </>
   );
 }
+
 

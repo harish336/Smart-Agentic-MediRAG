@@ -100,7 +100,7 @@ class GraphStore:
     # BATCH INGESTION (FULLY CORRECTED)
     # =====================================================
 
-    def batch_ingest(self, doc_id: str, chunks: list):
+    def batch_ingest(self, doc_id: str, chunks: list, owner_user_id: str | None = None):
         """
         High-performance ingestion using UNWIND.
         Fully idempotent.
@@ -112,6 +112,7 @@ class GraphStore:
 
         query = f"""
         MERGE (d:{DOCUMENT} {{{DOC_ID}: $doc_id}})
+        SET d.owner_user_id = $owner_user_id
 
         WITH d
         UNWIND $chunks AS chunk
@@ -127,7 +128,9 @@ class GraphStore:
         MERGE (ch:{CHUNK} {{{CHUNK_ID}: chunk.chunk_id}})
 
         SET ch.{DOC_ID} = $doc_id,
+            ch.owner_user_id = $owner_user_id,
             ch.{TEXT} = chunk.text,
+            ch.page_type = chunk.page_type,
             ch.{PAGE_LABEL} = chunk.page_label,
             ch.{PAGE_PHYSICAL} = chunk.page_physical
 
@@ -143,7 +146,8 @@ class GraphStore:
             with self.driver.session(database=self.database) as session:
                 session.run(query, {
                     "doc_id": doc_id,
-                    "chunks": chunks
+                    "chunks": chunks,
+                    "owner_user_id": owner_user_id,
                 })
 
         except Exception as e:
@@ -221,7 +225,8 @@ class GraphStore:
         query: str,
         limit: int,
         doc_id: str = None,
-        emotion: str = None
+        emotion: str = None,
+        owner_user_id: str = None,
     ):
         """
         Fast retrieval using fulltext index.
@@ -231,14 +236,22 @@ class GraphStore:
         cypher = f"""
         CALL db.index.fulltext.queryNodes("{CHUNK_TEXT_FULLTEXT_INDEX}", $query)
         YIELD node, score
+        OPTIONAL MATCH (s:Subheading)-[:HAS_CHUNK]->(node)
+        OPTIONAL MATCH (c:Chapter)-[:HAS_SUBHEADING]->(s)
         OPTIONAL MATCH (node)-[:HAS_EMOTION]->(e:Emotion)
         WHERE
             ($doc_id IS NULL OR node.doc_id = $doc_id)
             AND ($emotion IS NULL OR e.name = $emotion)
+            AND ($owner_user_id IS NULL OR node.owner_user_id = $owner_user_id OR node.owner_user_id IS NULL)
         RETURN
             node.chunk_id AS chunk_id,
             node.doc_id AS doc_id,
             node.text AS text,
+            node.page_type AS page_type,
+            node.page_label AS page_label,
+            node.page_physical AS page_physical,
+            c.name AS chapter,
+            s.name AS subheading,
             e.name AS emotion,
             score AS score
         ORDER BY score DESC
@@ -251,7 +264,8 @@ class GraphStore:
                 "query": query,
                 "limit": limit,
                 "doc_id": doc_id,
-                "emotion": emotion
+                "emotion": emotion,
+                "owner_user_id": owner_user_id,
             }
         )
 
