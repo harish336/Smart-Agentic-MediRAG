@@ -98,11 +98,13 @@ class AnsweringAgent:
         retrieval_options: Optional[Dict] = None,
         supplemental_context: str = "",
         conversation_window: str = "",
+        intent_override: Optional[str] = None,
     ) -> Dict:
         if not query or not query.strip():
             return {"response": "", "citations": [], "follow_up": ""}
 
         try:
+            logger.info("ANSWER_REQUEST query=%s", (query or "").strip()[:300])
             if self.router is None:
                 self.router = get_router()
             if self.prompt_builder is None:
@@ -110,25 +112,47 @@ class AnsweringAgent:
             if self.formatter is None:
                 self.formatter = get_formatter()
 
-            intent_input = retrieval_query or query
-            intent = self.router.classify(intent_input)
-            logger.info("Intent detected: %s", intent)
+            forced = (intent_override or "").strip().lower()
+            if forced in {"general", "medical", "book"}:
+                intent = forced
+                logger.info("Intent forced by mode policy: %s", intent)
+            elif forced == "knowledge":
+                intent = "book"
+                logger.info("Intent forced by mode policy: knowledge -> %s", intent)
+            else:
+                intent_input = retrieval_query or query
+                intent = self.router.classify(intent_input)
+                logger.info("Intent selected: %s", intent)
 
             if intent == "general":
-                prompt = self.prompt_builder.build_companion(query=query)
-                llm_response = self._call_llm(
-                    prompt=prompt,
-                    model=self.chat_model,
-                    generation_mode="creative_chat",
-                )
+                if (supplemental_context or "").strip():
+                    # Fast+upload "general + pdf" path: stay concise, but ground in uploaded text.
+                    prompt = self.prompt_builder.build_uploaded_document_qa(
+                        query=query,
+                        uploaded_text=supplemental_context,
+                        conversation_notes=conversation_window,
+                    )
+                    llm_response = self._call_llm(
+                        prompt=prompt,
+                        model=self.chat_model,
+                        generation_mode="grounded",
+                    )
+                else:
+                    prompt = self.prompt_builder.build_companion(query=query)
+                    llm_response = self._call_llm(
+                        prompt=prompt,
+                        model=self.chat_model,
+                        generation_mode="creative_chat",
+                    )
                 formatted_response = self.formatter.format(llm_response, intent="general")
 
                 if not formatted_response:
                     formatted_response = (
                         "I'm here with you. Tell me a bit more so I can help properly."
                     )
-
-                return {"response": formatted_response, "citations": [], "follow_up": ""}
+                result = {"response": formatted_response, "citations": [], "follow_up": ""}
+                self._log_final_answer(intent=intent, result=result)
+                return result
 
             if self.retriever is None:
                 self.retriever = get_retriever()
@@ -157,11 +181,13 @@ class AnsweringAgent:
             supplemental_chunks = self._build_supplemental_chunks(supplemental_context)
 
             if not retrieval_results and not supplemental_chunks:
-                return {
+                result = {
                     "response": "dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent, coverage),
                 }
+                self._log_final_answer(intent=intent, result=result)
+                return result
 
             if retrieval_results:
                 max_rerank_score = max(
@@ -178,11 +204,13 @@ class AnsweringAgent:
                     len(supplemental_chunks),
                 )
                 if max_rerank_score < rerank_threshold and not supplemental_chunks:
-                    return {
+                    result = {
                         "response": "dont have an answer",
                         "citations": [],
                         "follow_up": self._build_follow_up(query, intent, coverage),
                     }
+                    self._log_final_answer(intent=intent, result=result)
+                    return result
 
             context_chunks = retrieval_results[:MAX_CONTEXT_CHUNKS]
             if supplemental_chunks:
@@ -212,42 +240,87 @@ class AnsweringAgent:
                     )
                     llm_response = self._call_llm(prompt)
                     citations = citations_future.result() or []
+                    logger.info(
+                        "Book answer pipeline | context_chunks=%d citations=%d llm_chars=%d",
+                        len(context_chunks),
+                        len(citations),
+                        len(llm_response or ""),
+                    )
             else:
                 llm_response = self._call_llm(prompt)
 
             if not llm_response:
-                return {
+                result = {
                     "response": "dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent, coverage),
                 }
+                self._log_final_answer(intent=intent, result=result)
+                return result
+
+            # Guard against malformed table-only responses leaking from prior formatting turns.
+            if intent != "general" and not self._query_requests_table(query) and self._is_degenerate_table_only(llm_response):
+                logger.warning("Detected degenerate table-only answer; requesting grounded regeneration")
+                llm_response = self._call_llm(
+                    prompt=prompt + "\n\nAdditional instruction: Do NOT output a table. Use concise paragraphs or bullets.",
+                    model=self.knowledge_model,
+                    generation_mode="grounded",
+                )
+                if not llm_response:
+                    result = {
+                        "response": "dont have an answer",
+                        "citations": [],
+                        "follow_up": self._build_follow_up(query, intent, coverage),
+                    }
+                    self._log_final_answer(intent=intent, result=result)
+                    return result
 
             formatted_response = self.formatter.format(llm_response, intent=intent)
             if self._needs_follow_up(formatted_response):
-                return {
+                result = {
                     "response": "dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent, coverage),
                 }
+                self._log_final_answer(intent=intent, result=result)
+                return result
 
             if intent != "book":
                 citations = self.citation_manager.build(context_chunks)
+            logger.info(
+                "Final answer assembly | intent=%s context_chunks=%d citations=%d",
+                intent,
+                len(context_chunks),
+                len(citations),
+            )
             if not citations:
-                return {
+                logger.warning(
+                    "Dropping answer due to empty citations | intent=%s response_chars=%d context_chunks=%d",
+                    intent,
+                    len(formatted_response or ""),
+                    len(context_chunks),
+                )
+                result = {
                     "response": "dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent, coverage),
                 }
+                self._log_final_answer(intent=intent, result=result)
+                return result
 
-            return {"response": formatted_response, "citations": citations, "follow_up": ""}
+            result = {"response": formatted_response, "citations": citations, "follow_up": ""}
+            self._log_final_answer(intent=intent, result=result)
+            return result
 
         except Exception:
             logger.exception("Unhandled exception inside answer()")
-            return {
+            result = {
                 "response": "",
                 "citations": [],
                 "follow_up": self._build_follow_up(query, "general", []),
             }
+            self._log_final_answer(intent="general", result=result)
+            return result
 
     def _build_supplemental_chunks(self, supplemental_context: str) -> List[Dict]:
         text = (supplemental_context or "").strip()
@@ -550,3 +623,40 @@ class AnsweringAgent:
             return "Please share the chapter, section, or key terms you want me to focus on."
 
         return "Can you clarify your question with a bit more detail?"
+
+    @staticmethod
+    def _query_requests_table(query: str) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+        return bool(re.search(r"\b(table|tabular|as a table|table format)\b", text))
+
+    @staticmethod
+    def _is_degenerate_table_only(text: str) -> bool:
+        raw = (text or "").replace("\r\n", "\n").strip()
+        if not raw:
+            return False
+        lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+        if len(lines) > 2:
+            return False
+        if len(lines) == 1:
+            return lines[0].lower() in {"| topic | description |", "|topic|description|"}
+        return (
+            lines[0].lower() in {"| topic | description |", "|topic|description|"}
+            and bool(re.match(r"^\|\s*:?-{3,}:?\s*\|\s*:?-{3,}:?\s*\|$", lines[1]))
+        )
+
+    def _log_final_answer(self, intent: str, result: Dict) -> None:
+        response = (result.get("response") or "").strip()
+        follow_up = (result.get("follow_up") or "").strip()
+        citations = result.get("citations") or []
+        logger.info(
+            "FINAL_ANSWER_START intent=%s response_chars=%d citations=%d follow_up_chars=%d",
+            intent,
+            len(response),
+            len(citations),
+            len(follow_up),
+        )
+        logger.info("FINAL_ANSWER_RESPONSE %s", response if response else "<empty>")
+        logger.info("FINAL_ANSWER_FOLLOW_UP %s", follow_up if follow_up else "<empty>")
+        logger.info("FINAL_ANSWER_END")

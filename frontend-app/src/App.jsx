@@ -331,47 +331,7 @@ function formatAssistantContent(content) {
     .replace(/\\r/g, "\n")
     .replace(/\\t/g, "\t");
 
-  const normalized = applyOutsideCodeFences(unescaped, (segment) =>
-    normalizeDenseNarrative(
-      normalizeKeyValueLines(
-        normalizeReferencesSection(
-          normalizeListTrailingNarrative(
-            normalizeDashDelimitedNarrative(
-              expandColonDelimitedNestedBullets(
-                normalizeInlineSectionBullets(
-                  normalizePipeDelimitedBullets(
-                    repairSparseTwoColumnTables(
-                      flattenSingleColumnBulletTables(
-                        normalizePipeStructuredContent(
-                          normalizeMarkdownListIndentation(
-                            normalizeListHierarchy(
-                              normalizeInlineNumberedLists(
-                                expandColonDelimitedNestedBullets(normalizeUnicodeBullets(segment))
-                              )
-                            )
-                          )
-                        )
-                      )
-                    )
-                  )
-                )
-              )
-            )
-          )
-        )
-      )
-    )
-      .replace(/\r\n/g, "\n")
-      .replace(/[ \t]*-{8,}[ \t]*/g, "\n\n---\n\n")
-      .replace(/(^|\n)(#{1,6}[^\n]*)\n(?!\n)/g, "$1$2\n\n")
-      .replace(/(^|\n)---\n(?!\n)/g, "$1---\n\n")
-      .replace(/([^\n])\n(#{1,6}\s)/g, "$1\n\n$2")
-      .replace(/([^\n])\n([-\*]\s|\d+\.\s)/g, "$1\n\n$2")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim()
-  );
-
-  const finalContent = String(normalized || "").trim();
+  const finalContent = String(unescaped || "").trim();
   if (!finalContent) return "No response.";
   if (finalContent.toLowerCase() === "dont have an answer") {
     return "I don't have enough reliable context to answer that yet. Please share a bit more detail.";
@@ -920,10 +880,8 @@ function makeCanvasPreview(content, previewWords = CHAT_CANVAS_PREVIEW_WORDS) {
 function buildFinalQueryByMode(query, mode) {
   const normalizedQuery = String(query || "").trim();
   if (!normalizedQuery) return "";
-  if (mode === "pro") {
-    return /\bin book$/i.test(normalizedQuery) ? normalizedQuery : `${normalizedQuery} in book`;
-  }
-  return normalizedQuery.replace(/\s+in\s+book\s*$/i, "").trim();
+  // Keep user query unchanged across modes; mode behavior is handled by backend routing/profiles.
+  return normalizedQuery;
 }
 
 function normalizeAttachedFiles(files) {
@@ -1607,7 +1565,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
     () => ({
       table({ children, ...props }) {
         return (
-          <div className="my-4 w-full max-w-full overflow-x-auto rounded-xl border border-slate-700/80">
+          <div className="my-4 w-full max-w-full overflow-x-auto rounded-xl">
             <table {...props} className="w-full min-w-[680px] border-collapse table-auto text-[14px]">
               {children}
             </table>
@@ -1962,6 +1920,12 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
     queryMode = "",
     uploadIdsUsed = [],
   }) => {
+    console.debug("[chat] applyAssistantMessage", {
+      citationsCount: Array.isArray(citations) ? citations.length : 0,
+      agentUsed,
+      queryMode,
+      canvasLinked: Boolean(canvasLinked),
+    });
     const nextMessage = {
       role: "assistant",
       content: assistantContent,
@@ -2010,12 +1974,23 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
       query,
       thread_id: threadId || null,
       query_mode: queryMode || "fast",
+      intent_policy: (queryMode || "fast") === "pro" ? "knowledge" : "general",
       upload_ids: uploadIdsForQuestion,
+      has_uploaded_pdf:
+        (Array.isArray(uploadIdsForQuestion) && uploadIdsForQuestion.length > 0) ||
+        (Array.isArray(readyUploadIds) && readyUploadIds.length > 0),
       user_message_meta: userMessageMeta,
       thread_messages: buildThreadMessagesPayload(messages),
       rewrite_from_message_id: rewriteFromMessageId || "",
       agent_hint: agentHint || "",
       signal: askController.signal,
+    });
+    console.debug("[chat] askWithQuery response", {
+      threadId: res?.thread_id,
+      agentUsed: res?.agent_used,
+      queryMode: queryMode || "fast",
+      citationsCount: Array.isArray(res?.citations) ? res.citations.length : 0,
+      hasFollowUp: Boolean(res?.follow_up),
     });
     const resolvedThreadId = threadId || res.thread_id || "";
     if (!threadId && res.thread_id) setThreadId(res.thread_id);
@@ -2606,7 +2581,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                       className="h-full min-h-[220px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/70 p-5 text-sm leading-relaxed text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                     />
                     <div className="h-full min-h-[220px] overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
-                      <div className="w-full break-words text-[14px] leading-relaxed text-slate-200 
+                      <div className="assistant-markdown w-full break-words text-[14px] leading-relaxed text-slate-200 
                         [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
                         [&_p]:mb-4 [&_p]:leading-7 [&_p]:whitespace-pre-wrap
                         [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-7 [&_ul]:space-y-2 [&_li>ul]:mt-2 [&_li>ul]:ml-4 [&_li>ul]:pl-6 [&_ul_ul]:mt-2 [&_ul_ul]:mb-2 [&_ul_ul]:ml-4 [&_ul_ul]:pl-6 [&_ul_ul]:list-[circle] [&_ul_ul_ul]:mt-1 [&_ul_ul_ul]:ml-4 [&_ul_ul_ul]:pl-6 [&_ul_ul_ul]:list-[square]
@@ -2620,7 +2595,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                         [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
                         [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
                         [&_hr]:my-6 [&_hr]:border-slate-700/70
-                        [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-[14px] [&_table]:table-auto
+                        [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:text-[14px] [&_table]:table-auto
                         [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
                         [&_tbody_tr:nth-child(even)]:bg-slate-900/20
                         [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
@@ -2637,7 +2612,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                   </div>
                 ) : canvasView === "preview" ? (
                   <div className="h-full overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
-                    <div className="w-full break-words text-[14px] leading-relaxed text-slate-200 
+                    <div className="assistant-markdown w-full break-words text-[14px] leading-relaxed text-slate-200 
                       [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
                       [&_p]:mb-4 [&_p]:leading-7 [&_p]:whitespace-pre-wrap
                       [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-7 [&_ul]:space-y-2 [&_li>ul]:mt-2 [&_li>ul]:ml-4 [&_li>ul]:pl-6 [&_ul_ul]:mt-2 [&_ul_ul]:mb-2 [&_ul_ul]:ml-4 [&_ul_ul]:pl-6 [&_ul_ul]:list-[circle] [&_ul_ul_ul]:mt-1 [&_ul_ul_ul]:ml-4 [&_ul_ul_ul]:pl-6 [&_ul_ul_ul]:list-[square]
@@ -2651,7 +2626,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                       [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
                       [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
                       [&_hr]:my-6 [&_hr]:border-slate-700/70
-                      [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-[14px] [&_table]:table-auto
+                      [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:text-[14px] [&_table]:table-auto
                       [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
                       [&_tbody_tr:nth-child(even)]:bg-slate-900/20
                       [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
@@ -3091,11 +3066,6 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                 Boolean(msg.canvasLinked) ||
                 String(assistantSourceContent).includes(CHAT_CANVAS_PREVIEW_HINT) ||
                 countWords(assistantSourceContent) > CHAT_CANVAS_WORD_THRESHOLD;
-              const hideCitationsForProUpload =
-                !isUser &&
-                String(msg?.queryMode || "").toLowerCase() === "pro" &&
-                Array.isArray(msg?.uploadIdsUsed) &&
-                msg.uploadIdsUsed.length > 0;
               const assistantRenderContent = assistantNeedsCanvasPreview
                 ? makeCanvasPreview(assistantSourceContent, CHAT_CANVAS_PREVIEW_WORDS)
                 : formatAssistantContent(assistantSourceContent);
@@ -3106,7 +3076,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                       className={`relative rounded-[2rem] shadow-2xl ${
                       isUser
                         ? hasAttachedFiles
-                          ? "px-0 py-0 bg-transparent text-slate-100 rounded-tr-sm shadow-none border-0"
+                          ? "upload-combo-shell px-0 py-0 bg-transparent text-slate-100 rounded-tr-sm shadow-none border-0"
                           : isUploadMessage
                           ? "px-6 py-5 bg-slate-900/95 text-slate-100 rounded-tr-sm shadow-[0_10px_30px_rgba(15,23,42,0.45)] border border-cyan-500/35"
                           : "px-6 py-5 bg-gradient-to-br from-emerald-500 to-teal-600 text-white rounded-tr-sm shadow-[0_10px_30px_rgba(16,185,129,0.2)] border border-emerald-400/30"
@@ -3160,20 +3130,39 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                                     type="button"
                                     key={`${file.name}-${file.type}-${fileIndex}`}
                                     onClick={() => handleOpenAttachedUpload(file)}
-                                    className="min-w-[280px] rounded-2xl border border-slate-600/70 bg-[#1d2229]/95 px-4 py-3 text-left text-slate-100 shadow-[0_8px_24px_rgba(0,0,0,0.35)] transition-colors hover:bg-[#242b35]"
+                                    className={`min-w-[280px] rounded-2xl border px-4 py-3 text-left shadow-[0_8px_24px_rgba(0,0,0,0.35)] transition-colors ${
+                                      theme === "light"
+                                        ? "border-slate-300/90 bg-white text-slate-900 hover:bg-slate-50"
+                                        : "border-slate-600/70 bg-[#1d2229]/95 text-slate-100 hover:bg-[#242b35]"
+                                    }`}
                                     title="Click to open uploaded file"
                                   >
                                     <div className="flex items-center gap-3">
-                                      <div className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-rose-500 text-white">
+                                      <div
+                                        className={`inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl ${
+                                          theme === "light"
+                                            ? "bg-rose-100 text-rose-700"
+                                            : "bg-rose-500 text-white"
+                                        }`}
+                                      >
                                         <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 3v4a1 1 0 0 0 1 1h4M8 13h8M8 17h8M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" />
                                         </svg>
                                       </div>
                                       <div className="min-w-0">
-                                        <div className="truncate text-[17px] font-semibold text-slate-100" title={file.name}>
+                                        <div
+                                          className={`truncate text-[17px] font-semibold ${
+                                            theme === "light" ? "text-slate-900" : "text-slate-100"
+                                          }`}
+                                          title={file.name}
+                                        >
                                           {file.name}
                                         </div>
-                                        <div className="text-[11px] font-medium uppercase tracking-wide text-slate-300/90">
+                                        <div
+                                          className={`text-[11px] font-medium uppercase tracking-wide ${
+                                            theme === "light" ? "text-slate-500" : "text-slate-300/90"
+                                          }`}
+                                        >
                                           {openingUploadId && openingUploadId === resolveAttachedUploadId(file) ? "Opening..." : "PDF"}
                                         </div>
                                       </div>
@@ -3195,7 +3184,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                         </div>
                       ) : (
                         <div className="flex flex-col gap-2 w-full overflow-hidden">
-                          <div className={`w-full overflow-x-auto break-words text-[15px] leading-relaxed text-slate-200 
+                          <div className={`assistant-markdown w-full overflow-x-auto break-words text-[15px] leading-relaxed text-slate-200 
                             [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
                             [&_p]:mb-4 [&_p]:leading-7 [&_p]:whitespace-pre-wrap
                             [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-7 [&_ul]:space-y-2 [&_li>ul]:mt-2 [&_li>ul]:ml-4 [&_li>ul]:pl-6 [&_ul_ul]:mt-2 [&_ul_ul]:mb-2 [&_ul_ul]:ml-4 [&_ul_ul]:pl-6 [&_ul_ul]:list-[circle] [&_ul_ul_ul]:mt-1 [&_ul_ul_ul]:ml-4 [&_ul_ul_ul]:pl-6 [&_ul_ul_ul]:list-[square]
@@ -3209,7 +3198,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                             [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
                             [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
                             [&_hr]:my-6 [&_hr]:border-slate-700/70
-                            [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-[14px] [&_table]:table-auto
+                            [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:text-[14px] [&_table]:table-auto
                             [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
                             [&_tbody_tr:nth-child(even)]:bg-slate-900/20
                             [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
@@ -3238,9 +3227,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                               </button>
                             </div>
                           )}
-                          {!hideCitationsForProUpload && (
-                            <CitationBox citations={msg.citations} addToast={addToast} />
-                          )}
+                          <CitationBox citations={msg.citations} addToast={addToast} />
                         </div>
                       )}
                     </div>

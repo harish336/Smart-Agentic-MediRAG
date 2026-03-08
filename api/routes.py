@@ -8,6 +8,7 @@ Includes:
 """
 
 import os
+import re
 import time
 import uuid
 import threading
@@ -49,6 +50,7 @@ from database.app_store import (
     get_user_upload,
     list_all_conversations,
     list_user_uploads,
+    bind_uploads_to_thread,
     list_users,
     save_message,
     thread_belongs_to_user,
@@ -601,6 +603,30 @@ def _collect_upload_bundle(
 
     deduped_doc_ids = list(dict.fromkeys(selected_doc_ids))
     return "\n\n".join(context_parts).strip(), deduped_doc_ids
+
+
+def _looks_pdf_or_upload_query(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b(pdf|uploaded|upload|document|file|chapter|section|summary|summari[sz]e)\b",
+            text,
+        )
+    )
+
+
+def _needs_extended_upload_context(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"\b(chapter[-\s]*wise|chapter\s+wise|all\s+chapters?|list\s+of\s+chapters?|detailed\s+summary|full\s+summary|complete\s+summary|comprehensive\s+summary)\b",
+            text,
+        )
+    )
 
 
 def _build_regeneration_context(thread_id: str, rewrite_from_message_id: str) -> str:
@@ -1431,6 +1457,8 @@ def register_routes(app):
         rewrite_from_message_id = (data.get("rewrite_from_message_id") or "").strip()
         agent_hint = (data.get("agent_hint") or "").strip().lower()
         query_mode = (data.get("query_mode") or "fast").strip().lower()
+        intent_policy = (data.get("intent_policy") or "").strip().lower()
+        has_uploaded_pdf = _to_bool(data.get("has_uploaded_pdf"), default=False)
         global_pref_update = data.get("user_global_preference")
         thread_pref_update = data.get("thread_preference")
         if not query:
@@ -1449,10 +1477,26 @@ def register_routes(app):
             return jsonify({"error": "agent_hint must be memory_answering_agent or uploaded_document_agent"}), 400
         if query_mode not in {"fast", "pro"}:
             return jsonify({"error": "query_mode must be fast or pro"}), 400
+        if intent_policy and intent_policy not in {"general", "knowledge"}:
+            return jsonify({"error": "intent_policy must be general or knowledge"}), 400
 
         user_id = g.user["user_id"]
         user_role = g.user["role"]
         upload_ids = [str(item or "").strip() for item in upload_ids_raw if str(item or "").strip()]
+        if upload_ids:
+            has_uploaded_pdf = True
+        logger.info(
+            "chat_ask_request user_id=%s role=%s thread_id=%s mode=%s intent_policy=%s agent_hint=%s uploads=%d has_uploaded_pdf=%s query_chars=%d",
+            user_id,
+            user_role,
+            requested_thread_id or "<new>",
+            query_mode,
+            intent_policy or "<default>",
+            agent_hint or "<none>",
+            len(upload_ids),
+            has_uploaded_pdf,
+            len(query),
+        )
 
         if requested_thread_id:
             if user_role != "admin" and not thread_belongs_to_user(requested_thread_id, user_id):
@@ -1463,6 +1507,54 @@ def register_routes(app):
                 return jsonify({"error": "thread access denied"}), 403
         else:
             thread_id = create_thread(user_id=user_id, title=query)
+
+        # Ensure uploads used in this ask are attached to the resolved thread.
+        if upload_ids:
+            try:
+                bound = bind_uploads_to_thread(user_id=user_id, thread_id=thread_id, upload_ids=upload_ids)
+                if bound:
+                    logger.info(
+                        "chat_ask_bound_uploads thread_id=%s bound=%d",
+                        thread_id,
+                        bound,
+                    )
+            except Exception:
+                logger.exception("chat_ask_bound_uploads_failed thread_id=%s", thread_id)
+
+        # Recovery path: if uploads are missing from request, infer from thread history
+        # for PDF-oriented prompts so backend routing still uses uploaded-document context.
+        should_recover_thread_uploads = (has_uploaded_pdf or _looks_pdf_or_upload_query(query)) and not upload_ids
+        if should_recover_thread_uploads:
+            thread_uploads = list_user_uploads(user_id=user_id, thread_id=thread_id, limit=200)
+            recovered_ids = [
+                str(row.get("id") or "").strip()
+                for row in (thread_uploads or [])
+                if (row.get("status") or "").strip().lower() == "completed"
+            ]
+            # Fallback: if thread has no linked uploads yet, use a single recent unbound upload
+            # (common when upload happened before thread creation).
+            if not recovered_ids:
+                all_uploads = list_user_uploads(user_id=user_id, thread_id=None, limit=200)
+                unbound_completed = [
+                    str(row.get("id") or "").strip()
+                    for row in (all_uploads or [])
+                    if (row.get("status") or "").strip().lower() == "completed"
+                    and not str(row.get("thread_id") or "").strip()
+                ]
+                if len(unbound_completed) == 1:
+                    recovered_ids = [unbound_completed[0]]
+            upload_ids = [uid for uid in recovered_ids if uid]
+            if upload_ids:
+                has_uploaded_pdf = True
+                logger.info(
+                    "chat_ask_recovered_upload_ids thread_id=%s recovered=%d",
+                    thread_id,
+                    len(upload_ids),
+                )
+                try:
+                    bind_uploads_to_thread(user_id=user_id, thread_id=thread_id, upload_ids=upload_ids)
+                except Exception:
+                    logger.exception("chat_ask_recovered_bind_failed thread_id=%s", thread_id)
 
         if global_pref_update is not None:
             if not isinstance(global_pref_update, dict):
@@ -1504,12 +1596,15 @@ def register_routes(app):
             context_prefix_base = "\n\n".join(
                 [part for part in [context_prefix_base, regeneration_context] if part]
             )
-        upload_context_chars = 24000 if query_mode == "pro" else 12000
+        if _needs_extended_upload_context(query):
+            upload_context_chars = 120000 if query_mode == "pro" else 60000
+        else:
+            upload_context_chars = 24000 if query_mode == "pro" else 12000
         upload_context, selected_doc_ids = _collect_upload_bundle(
             user_id=user_id,
             upload_ids=upload_ids,
             max_chars=upload_context_chars,
-            include_indexed_text=(agent_hint == "uploaded_document_agent"),
+            include_indexed_text=bool(upload_ids) or has_uploaded_pdf or (agent_hint == "uploaded_document_agent"),
         )
         retrieval_filters = {"owner_user_id": user_id} if user_role != "admin" else None
 
@@ -1520,12 +1615,14 @@ def register_routes(app):
                 query=query,
                 thread_id=thread_id,
                 query_mode=query_mode,
+                intent_policy=intent_policy,
                 context_prefix_base=context_prefix_base,
                 upload_context=upload_context,
                 selected_doc_ids=selected_doc_ids,
                 agent_hint=agent_hint,
                 retrieval_filters=retrieval_filters,
                 thread_messages=thread_messages,
+                has_uploaded_pdf=has_uploaded_pdf,
             )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
@@ -1533,8 +1630,14 @@ def register_routes(app):
         assistant_response = result.get("response", "") or ""
         follow_up = result.get("follow_up", "") or ""
         citations = _structured_citations(result.get("citations", []) or [])
-        if query_mode == "pro" and upload_ids:
-            citations = []
+        logger.info(
+            "chat_ask_result thread_id=%s agent_used=%s response_chars=%d raw_citations=%d structured_citations=%d",
+            thread_id,
+            agent_used,
+            len(assistant_response),
+            len(result.get("citations", []) or []),
+            len(citations),
+        )
 
         save_message(
             thread_id=thread_id,
@@ -1547,6 +1650,11 @@ def register_routes(app):
             role="assistant",
             content=assistant_response,
             citations=citations,
+        )
+        logger.info(
+            "chat_ask_saved thread_id=%s citations_saved=%d",
+            thread_id,
+            len(citations),
         )
 
         try:

@@ -234,14 +234,22 @@ class TextAccumulator:
         floor = max(int(preferred * 0.65), 120)
         window = text[:preferred + 1]
 
-        sentence_cut = max(window.rfind(". "), window.rfind("? "), window.rfind("! "))
-        if sentence_cut >= floor:
-            return sentence_cut + 1
+        # 1. Prefer double newlines (paragraphs)
+        para_cut = window.rfind("\n\n")
+        if para_cut >= floor:
+            return para_cut + 2
 
+        # 2. Prefer single newlines (bullets, structure)
         newline_cut = window.rfind("\n")
         if newline_cut >= floor:
             return newline_cut + 1
 
+        # 3. Prefer end of sentence
+        sentence_cut = max(window.rfind(". "), window.rfind("? "), window.rfind("! "))
+        if sentence_cut >= floor:
+            return sentence_cut + 1
+
+        # 4. Final fallback to word boundary
         space_cut = window.rfind(" ")
         if space_cut >= floor:
             return space_cut + 1

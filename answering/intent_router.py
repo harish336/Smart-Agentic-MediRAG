@@ -43,7 +43,7 @@ class IntentRouter:
         self, 
         ollama_url: str = "http://localhost:11434/api/generate",
         llm_model: str = "mistral:7b-instruct",
-        similarity_threshold: float = 0.55
+        similarity_threshold: float = 0.45
     ):
         self.ollama_url = ollama_url
         self.llm_model = llm_model
@@ -62,20 +62,28 @@ class IntentRouter:
                 "medical diagnosis",
                 "clinical treatment",
                 "disease symptoms",
-                "therapy and disorder"
+                "therapy and disorder",
+                "what is the cure or medication",
+                "side effects of drug",
+                "surgical procedure"
             ],
             "book": [
                 "chapter explanation",
                 "from the textbook",
                 "section summary",
-                "explain from the book"
+                "explain from the book",
+                "what does the author say about",
+                "summarize this page",
+                "according to the text"
             ],
             "general": [
                 "casual conversation",
                 "general knowledge question",
                 "simple explanation",
                 "friendly chat",
-                "hello, how are you"
+                "hello, how are you",
+                "who made you",
+                "what can you do"
             ]
         }
 
@@ -166,6 +174,11 @@ Query: "{query}"
 Label:"""
 
         try:
+            logger.info(
+                "INTENT_LLM_REQUEST model=%s query=%s",
+                self.llm_model,
+                query.strip()[:200],
+            )
             response = requests.post(
                 self.ollama_url,
                 json={
@@ -183,6 +196,13 @@ Label:"""
             response.raise_for_status()
 
             result_text = response.json().get("response", "").strip().lower()
+            logger.info(
+                "INTENT_LLM_RESPONSE_START model=%s chars=%d",
+                self.llm_model,
+                len(result_text),
+            )
+            logger.info("%s", result_text if result_text else "<empty>")
+            logger.info("INTENT_LLM_RESPONSE_END")
 
             for intent in self.valid_intents:
                 if intent in result_text:

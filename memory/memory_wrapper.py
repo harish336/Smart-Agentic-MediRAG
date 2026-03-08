@@ -3,7 +3,6 @@ SmartChunk-RAG — Memory Wrapper
 """
 
 import uuid
-import os
 import re
 import inspect
 from typing import Dict, List, Optional
@@ -11,15 +10,14 @@ import requests
 
 from memory.memory_service import MemoryService
 from answering.answering_agent import AnsweringAgent
-from answering.prompt_builder import PromptBuilder
 from answering.response_formatter import ResponseFormatter
+from answering.transformation_agent import TransformationAgent
 from core.utils.logging_utils import get_component_logger
 from database.app_store import get_thread_messages
 
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 CLASSIFIER_MODEL = "mistral:7b-instruct"
-TRANSFORM_MODEL = os.getenv("OLLAMA_CHAT_MODEL", os.getenv("OLLAMA_MODEL", CLASSIFIER_MODEL))
 
 
 # ============================================================
@@ -40,7 +38,7 @@ class MemoryWrappedAnsweringAgent:
         self.agent = base_agent
         self.memory = MemoryService()
         self.formatter = ResponseFormatter()
-        self.prompt_builder = PromptBuilder()
+        self.transformation_agent = TransformationAgent()
 
     # ============================================================
     # MAIN ENTRY
@@ -56,6 +54,8 @@ class MemoryWrappedAnsweringAgent:
         thread_messages: Optional[List[Dict]] = None,
         retrieval_options: Optional[Dict] = None,
         uploaded_context: str = "",
+        query_type_override: Optional[str] = None,
+        intent_override: Optional[str] = None,
     ) -> Dict:
 
         if not user_id:
@@ -80,8 +80,20 @@ class MemoryWrappedAnsweringAgent:
             # Classify Query Type (LLM)
             # --------------------------------------------
 
-            query_type = self._classify_query_type(query)
-            logger.info(f"Query classified as: {query_type}")
+            forced_query_type = (query_type_override or "").strip().lower()
+            if forced_query_type in {"knowledge", "transformation"}:
+                query_type = forced_query_type
+                logger.info("Query type forced by mode policy: %s", query_type)
+            else:
+                query_type = self._classify_query_type(query)
+                if (
+                    query_type == "transformation"
+                    and uploaded_context.strip()
+                    and self._looks_like_upload_knowledge_query(query)
+                ):
+                    logger.info("Overriding transformation classification to knowledge for upload-grounded query")
+                    query_type = "knowledge"
+                logger.info(f"Query classified as: {query_type}")
 
             # --------------------------------------------
             # Routing Logic
@@ -112,9 +124,9 @@ class MemoryWrappedAnsweringAgent:
                         "user_id": user_id
                     }
 
-                transformed = self._transform_previous_answer(
-                    previous_answer=last_answer,
+                transformed = self.transformation_agent.transform(
                     instruction=transform_instruction,
+                    source_text=last_answer,
                 )
                 if not transformed:
                     transformed = "dont have an answer"
@@ -140,6 +152,7 @@ class MemoryWrappedAnsweringAgent:
                     "thread_messages": thread_messages,
                     "retrieval_options": retrieval_options,
                     "supplemental_context": uploaded_context,
+                    "intent_override": intent_override,
                 }
                 # Backward compatibility: older AnsweringAgent versions may not yet
                 # accept conversation_window in rolling reload environments.
@@ -180,7 +193,7 @@ class MemoryWrappedAnsweringAgent:
 
         except Exception:
             logger.exception("Error inside memory wrapper")
-            return {"response": "", "citations": []}
+            return {"response": "dont have an answer", "citations": []}
 
     def _get_last_assistant_from_messages(self, thread_messages: Optional[List[Dict]]) -> str:
         for message in reversed(thread_messages or []):
@@ -389,6 +402,9 @@ class MemoryWrappedAnsweringAgent:
     # ============================================================
 
     def _classify_query_type(self, query: str) -> str:
+        if self._looks_like_upload_knowledge_query(query):
+            return "knowledge"
+
         # Deterministic short-circuit for common follow-up formatting requests.
         if self._looks_like_transformation(query):
             return "transformation"
@@ -464,6 +480,12 @@ transformation:
         text = (query or "").strip().lower()
         if not text:
             return False
+        has_upload_marker = bool(
+            re.search(r"\b(pdf|uploaded|upload|document|file|attached|chapter|page|section)\b", text)
+        )
+        # Upload/PDF-referenced asks should stay in knowledge flow, not previous-answer transformation.
+        if has_upload_marker:
+            return False
         has_transform_verb = bool(
             re.search(
                 r"\b(format|reformat|rewrite|convert|summari[sz]e|shorten|simplify|paraphrase|make)\b",
@@ -476,10 +498,29 @@ transformation:
                 text,
             )
         )
-        has_reference = bool(re.search(r"\b(above|previous|earlier|that|this|it|response|answer)\b", text))
+        has_reference = bool(re.search(r"\b(above|previous|earlier|response|answer)\b", text))
+        if not has_reference:
+            has_weak_reference = bool(re.search(r"\b(this|that|it)\b", text))
+            has_reference = has_weak_reference and not has_upload_marker
         return (has_transform_verb and has_reference) or (
             has_transform_verb and has_format_target and len(text.split()) <= 20
         )
+
+    @staticmethod
+    def _looks_like_upload_knowledge_query(query: str) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+        has_upload_marker = bool(
+            re.search(r"\b(pdf|uploaded|upload|document|file|attached|chapter|page|section)\b", text)
+        )
+        has_knowledge_verb = bool(
+            re.search(
+                r"\b(summari[sz]e|summary|chapter[-\s]*wise|chapter\s+wise|chapter\s+names?|list\s+of\s+chapters?|explain|describe|detail|overview|key points|main points|what|why|how)\b",
+                text,
+            )
+        )
+        return has_upload_marker and has_knowledge_verb
 
     @staticmethod
     def _extract_inline_transformation_source(query: str) -> tuple[str, str]:
@@ -519,33 +560,3 @@ transformation:
 
         return "", ""
 
-    def _transform_previous_answer(self, previous_answer: str, instruction: str) -> str:
-        source = (previous_answer or "").strip()
-        request = (instruction or "").strip()
-        if not source or not request:
-            return ""
-
-        prompt = self.prompt_builder.build_transformation_prompt(
-            instruction=request,
-            source_text=source,
-        )
-        payload = {
-            "model": TRANSFORM_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "top_p": 0.3,
-                "top_k": 40,
-                "repeat_penalty": 1.1,
-                "num_predict": 900,
-            },
-        }
-
-        try:
-            response = requests.post(OLLAMA_URL, json=payload, timeout=90)
-            if response.status_code != 200:
-                return ""
-            return (response.json().get("response") or "").strip()
-        except Exception:
-            return ""

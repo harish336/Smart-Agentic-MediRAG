@@ -13,7 +13,7 @@ from core.toc.confidence import TOCConfidenceScorer
 from core.toc.offset_finder import OffsetFinder
 from core.utils.logging_utils import get_component_logger
 
-SAVE_INTERMEDIATE = True
+SAVE_INTERMEDIATE = False
 
 
 # =====================================================

@@ -29,6 +29,7 @@ from .intent_router import IntentRouter
 from .citation_manager import CitationManager
 from .prompt_builder import PromptBuilder
 from .response_formatter import ResponseFormatter
+from .transformation_agent import TransformationAgent
 
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "CitationManager",
     "PromptBuilder",
     "ResponseFormatter",
+    "TransformationAgent",
 ]
 
 __version__ = "1.0.0"

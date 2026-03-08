@@ -165,27 +165,6 @@ class ResponseFormatter:
 
         # 8. collapse excessive blank lines and trailing spaces
         text = self._remove_meta_grounding_language(text)
-        text = self._normalize_reference_sections(text)
-        text = self._normalize_key_value_lines(text)
-        if self._contains_fenced_code(text):
-            text = self._normalize_common_generation_artifacts(text)
-        else:
-            text = self._normalize_pipe_structured_output(text)
-            text = self._normalize_tabular_output(text)
-            text = self._repair_sparse_two_column_tables(text)
-            text = self._remove_placeholder_two_column_rows(text)
-            text = self._improve_readability_layout(text)
-            text = self._merge_numbered_item_continuations(text)
-            text = self._convert_long_paragraphs_to_bullets(text)
-            text = self._normalize_long_plain_narrative(text)
-            text = self._normalize_common_generation_artifacts(text)
-            text = self._normalize_pipe_delimited_bullets(text)
-            text = self._normalize_dash_delimited_narrative(text)
-        text = self._clean_spacing(text)
-        text = self._normalize_list_layout(text)
-        text = self._canonicalize_ordered_section_blocks(text)
-        text = self._normalize_markdown_layout(text)
-        text = self._remove_orphan_pipe_rows(text)
         text = self._clean_spacing(text)
 
         # 9. stable behavior for "dont have an answer"

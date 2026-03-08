@@ -43,58 +43,38 @@ class PromptBuilder:
         - Return only final answer body.
         - No wrappers/intros (e.g., "Here is your answer").
         - No meta-statements about retrieval, instructions, or sources.
-        - Do not use words "context" or "content" in the final answer.
+        - Do not use words "context", "content", "source", or "book" in a meta/explanatory way.
+        - Never use the word "book" in the final answer.
+        - Forbidden phrases in final answer:
+          "provided context", "provided content", "provided source", "provided sources",
+          "provided book", "the provided book", "from the provided source", "based on the provided",
+          "based on the context", "text you provided", "not explicitly mentioned in the text".
         - Do not add a heading/title unless user asks.
     """).strip()
 
     _ANTI_META_POLICY = textwrap.dedent("""
-        ### STRICT ANTI-META RESPONSE POLICY ###
-        - Treat retrieved evidence as internal knowledge only.
-        - Never mention retrieval mechanics, chunks, or source structure.
-
-        Forbidden output terms/phrases (or close variants):
-        - context
-        - content
-        - source
-        - document
-        - the text says
-        - based on the provided
-        - according to the context
-        - from the source
-        - citation markers like [Source 1], [Source 2]
-
-        Response style:
-        - Write direct, natural, authoritative explanations.
-        - Avoid technical RAG wording and provenance commentary.
+        ### CONSTRAINTS ###
+        - Treat retrieved evidence as internal knowledge.
+        - NEVER mention "context", "content", "source", "sources", or "provided book".
+        - NEVER use citation markers like [Source 1] or phrases like "based on the provided ...".
     """).strip()
 
     _MEMORY_USAGE_PROTOCOL = textwrap.dedent("""
         ### MEMORY USAGE PROTOCOL ###
-        Priority order (highest to lowest):
-        1) Current user query
-        2) Short-term memory (last 4 turns)
-        3) Chat-history references to prior answers
-        4) User preferences (session/thread)
-        5) User global preferences
-        6) Long-term memory
-
-        Rules:
-        - Resolve follow-up references (e.g., above/that/previous response/table/example) from short-term memory first.
-        - Use long-term memory only when clearly relevant to the current user query.
-        - Apply user formatting/tone/verbosity/technical-level preferences silently.
-        - Avoid repeating known long-term memory facts unless needed for this answer.
-        - If a reference is ambiguous, choose the most recent valid target from short-term history.
-        - Never reveal or mention internal memory structures in the final answer.
+        - Resolve follow-up references from recent turns first.
+        - Apply user preferences silently.
+        - Use long-term memory only when relevant.
+        - Never expose internal memory handling in the final answer.
     """).strip()
 
     _RAG_POLICY = textwrap.dedent("""
         ### STRICT SAFETY RULES ###
-        - Use only provided evidence.
-        - Do not use external knowledge or guess.
-
-        ### ANTI-HALLUCINATION POLICY ###
-        - If answer is not explicitly supported by evidence, output exactly:
-        dont have an answer
+        - Answer the user's specific question directly.
+        - Never explain what was or was not "mentioned in the text"; just answer from evidence.
+        - Never say "based on the context/text provided" or similar framing.
+        - Do NOT summarize the provided text or Table of Contents unless explicitly requested.
+        - Use ONLY provided evidence.
+        - If the answer is missing, output exactly: dont have an answer
     """).strip()
 
     _COMPANION_BOUNDARIES = textwrap.dedent("""
@@ -133,6 +113,14 @@ class PromptBuilder:
         {memory_protocol}
         {format_contract}
         {output_rules}
+        ### UPLOAD-SPECIFIC RULES ###
+        - Never output placeholders like [Title], [Chapter], [Section], or bracketed template fields.
+        - Never fabricate a generic chapter-wise template.
+        - Do not output "Title:" or "Author:" fields unless explicitly present in UPLOADED DOCUMENT.
+        - If title/author is missing in UPLOADED DOCUMENT, do not guess and do not write "Unknown".
+        - Never invent chapter headings or chapter numbers that do not appear in UPLOADED DOCUMENT.
+        - For chapter-wise requests, include only chapter titles explicitly present in UPLOADED DOCUMENT.
+        - If the uploaded text does not support a detailed answer, output exactly: dont have an answer
 
         ### CONVERSATION NOTES ###
         {conversation_notes}
@@ -164,20 +152,20 @@ class PromptBuilder:
         - Treat PREVIOUS ASSISTANT RESPONSE as the only source.
         - Do not retrieve, infer, or add new information.
         - Preserve all original facts and meaning.
-        - Do not summarize or omit details.
+        - Do not summarize or omit details unless the user explicitly asks to summarize.
+        - Never add caveats/disclaimers about missing info unless the source itself says that.
 
         ### TRANSFORMATION POLICY ###
-        - Perform structure conversion only (not content expansion).
-        - Parse headings, numbered sections, bullet points, nested bullets, and paragraphs.
-        - Flatten hierarchy into table rows while preserving meaning.
-        - Output exactly one Markdown table with exactly two columns:
-          | Topic | Description |
-        - Each major heading or numbered item becomes one row.
-        - Bullet points under a section must be combined in Description using semicolons (;).
-        - Do not create extra rows for nested bullets.
-        - Keep one logical section per row.
-        - Keep each row on one line; never split a row across lines.
-        - Do not output any text before or after the table.
+        - Perform format conversion only (not content expansion).
+        - Follow the user's target format exactly (e.g., bullets, table, steps, concise summary).
+        - If the user requests bullets, output markdown bullets (one logical point per line).
+        - If the user requests a table, output a valid markdown table.
+        - If the user requests concise output, reduce wording without changing facts.
+        - Preserve meaning and factual scope from source text.
+        - Output only the transformed result body (no intro/outro text).
+        - Do not use meta-references like "provided text", "provided context", "based on the context",
+          "from the source", "the source says", "the text you provided", "book is not explicitly mentioned".
+        - Do not use phrases such as "however", "it appears", or "not explicitly mentioned" to speculate.
     """).strip()
 
     _TRANSFORMATION_TEMPLATE = textwrap.dedent("""
@@ -196,7 +184,7 @@ class PromptBuilder:
         {source_text}
 
         ### REQUIRED OUTPUT ###
-        Return ONLY the Markdown table.
+        Return ONLY the transformed Markdown, strictly following USER INSTRUCTION.
         [/INST]
     """).strip()
 
@@ -239,6 +227,8 @@ class PromptBuilder:
         - Do NOT add explanations before/after the table.
         - Do NOT include titles or commentary.
         - Do NOT output code fences.
+        - Do NOT include meta language such as "based on the context", "text you provided",
+          "provided source", "provided book", or "not explicitly mentioned".
 
         ### USER INSTRUCTION ###
         {instruction}
@@ -268,6 +258,8 @@ class PromptBuilder:
         - Never use HTML tags.
         - Return ONLY the formatted Markdown.
         - Do not include commentary or code fences.
+        - Do not add meta phrases like "based on the context", "text you provided",
+          "provided source", "provided book", "not explicitly mentioned", or speculative caveats.
 
         STRUCTURE RULES
         1) TITLE

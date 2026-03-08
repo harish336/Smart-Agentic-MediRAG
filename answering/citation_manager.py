@@ -14,6 +14,11 @@ import os
 import hashlib
 import re
 
+from core.utils.logging_utils import get_component_logger
+
+
+logger = get_component_logger("CitationManager", component="answering")
+
 
 class CitationManager:
 
@@ -41,6 +46,7 @@ class CitationManager:
 
         citations = []
         seen_keys = set()
+        input_count = len(retrieved_chunks or [])
 
         for r in retrieved_chunks:
 
@@ -106,6 +112,12 @@ class CitationManager:
 
             citations.append(citation)
 
+        logger.info(
+            "Citation build summary | input_chunks=%d output_citations=%d dedup_keys=%d",
+            input_count,
+            len(citations),
+            len(seen_keys),
+        )
         return citations
 
     # ============================================================
@@ -145,8 +157,8 @@ class CitationManager:
                 if file_hash.startswith(doc_id):
                     return filename
 
-        except Exception as e:
-            print("[CITATION MANAGER ERROR]", e)
+        except Exception:
+            logger.exception("Citation doc_id -> filename mapping failed | doc_id=%s", doc_id)
 
         return None
 

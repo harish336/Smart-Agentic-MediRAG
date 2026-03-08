@@ -15,9 +15,9 @@ logger = get_component_logger("ChatOrchestrator", component="answering")
 
 class ChatOrchestrator:
     _FAST_PROFILE = {
-        "mode": "hybrid",
-        "top_k": 6,
-        "initial_k": 16,
+        "mode": "vector",
+        "top_k": 4,
+        "initial_k": 12,
         "max_sub_queries": 1,
     }
     _PRO_PROFILE = {
@@ -43,18 +43,19 @@ class ChatOrchestrator:
         query: str,
         thread_id: str,
         query_mode: str,
+        intent_policy: str,
         context_prefix_base: str,
         upload_context: str,
         selected_doc_ids: List[str],
         agent_hint: str,
         retrieval_filters: Optional[Dict],
         thread_messages: Optional[List[Dict]],
+        has_uploaded_pdf: bool = False,
     ) -> Tuple[Dict, str]:
         mode = (query_mode or "fast").strip().lower()
         if mode not in {"fast", "pro"}:
             mode = "fast"
         is_pro_mode = mode == "pro"
-
         profile = self._PRO_PROFILE if mode == "pro" else self._FAST_PROFILE
         scoped_filters = self._with_doc_scope(
             retrieval_filters=retrieval_filters,
@@ -67,9 +68,11 @@ class ChatOrchestrator:
                 part for part in [context_prefix, "### Uploaded Context\n" + upload_context] if part
             )
 
-        # Transformation commands must use previous assistant response as source,
-        # not fresh retrieval from uploads/index.
-        if self._is_transformation_query(query):
+        has_upload = bool(upload_context.strip()) or bool(has_uploaded_pdf)
+        is_transform_request = self._is_transformation_query(query)
+
+        # Transformation requests should operate on prior assistant output, not re-answer.
+        if is_transform_request:
             result = self.memory_agent.answer(
                 user_id=user_id,
                 query=query,
@@ -79,56 +82,32 @@ class ChatOrchestrator:
                 thread_messages=thread_messages,
                 retrieval_options=profile,
                 uploaded_context="",
+                query_type_override="transformation",
+                intent_override="",
             )
-            if (result.get("response") or "").strip():
-                return result, "memory_answering_agent_transformation"
+            return result, "transformation_agent"
 
-        # Questions targeted at the uploaded PDF should stay upload-only.
-        if upload_context and self._is_upload_specific_query(query):
+        pdf_only_needed = has_upload and self._is_pdf_question(query, thread_messages)
+
+        # If query is clearly PDF-scoped, answer directly from uploaded PDF (fast + pro).
+        if pdf_only_needed:
             result = self.uploaded_doc_agent.answer(
                 query=query,
                 uploaded_context=upload_context,
                 context_prefix=context_prefix_base,
             )
-            if (result.get("response") or "").strip().lower() != "dont have an answer":
-                return result, "uploaded_document_agent_pdf_only"
+            return result, "uploaded_document_agent_pdf_only"
 
-        # Forced upload-first routing when explicitly requested.
-        if upload_context and agent_hint == "uploaded_document_agent":
-            result = self.uploaded_doc_agent.answer(
-                query=query,
-                uploaded_context=upload_context,
-                context_prefix=context_prefix_base,
-            )
-            if (result.get("response") or "").strip().lower() != "dont have an answer":
-                return result, "uploaded_document_agent"
-
-        # Pro mode: combine indexed retrieval with uploaded chat-document evidence.
-        if is_pro_mode and upload_context and agent_hint != "uploaded_document_agent":
-            result = self.memory_agent.answer(
-                user_id=user_id,
-                query=query,
-                thread_id=thread_id,
-                context_prefix=context_prefix,
-                retrieval_filters=scoped_filters,
-                thread_messages=thread_messages,
-                retrieval_options=profile,
-                uploaded_context=upload_context,
-            )
-            if (result.get("response") or "").strip().lower() != "dont have an answer":
-                return result, "memory_answering_agent_pro_hybrid"
-
-        # Fast mode: if uploaded text is available, prefer document-grounded answering.
-        upload_first = bool(upload_context) and agent_hint != "memory_answering_agent" and not is_pro_mode
-        if upload_first:
-            result = self.uploaded_doc_agent.answer(
-                query=query,
-                uploaded_context=upload_context,
-                context_prefix=context_prefix_base,
-            )
-            if (result.get("response") or "").strip().lower() != "dont have an answer":
-                return result, "uploaded_document_agent"
-
+        # Non PDF-only queries:
+        # - pro => knowledge (+pdf when uploaded)
+        # - fast => general (+pdf when uploaded)
+        uploaded_context_for_memory = upload_context if has_upload else ""
+        # UI intent-policy flag is authoritative when provided.
+        ui_intent = (intent_policy or "").strip().lower()
+        if ui_intent in {"general", "knowledge"}:
+            forced_intent = ui_intent
+        else:
+            forced_intent = "knowledge" if is_pro_mode else "general"
         result = self.memory_agent.answer(
             user_id=user_id,
             query=query,
@@ -137,31 +116,17 @@ class ChatOrchestrator:
             retrieval_filters=scoped_filters,
             thread_messages=thread_messages,
             retrieval_options=profile,
-            uploaded_context=upload_context if is_pro_mode else "",
+            uploaded_context=uploaded_context_for_memory,
+            query_type_override="knowledge",
+            intent_override=forced_intent,
         )
-        if (result.get("response") or "").strip().lower() != "dont have an answer":
-            return result, "memory_answering_agent"
-
-        if upload_context:
-            fallback = self.uploaded_doc_agent.answer(
-                query=query,
-                uploaded_context=upload_context,
-                context_prefix=context_prefix_base,
-            )
-            if (fallback.get("response") or "").strip().lower() != "dont have an answer":
-                return fallback, "uploaded_document_agent_fallback"
-
-        if user_role == "admin" and upload_context and agent_hint != "uploaded_document_agent":
-            # Admins may not have owner-scoped retrieval filters. One final direct pass can recover.
-            fallback = self.uploaded_doc_agent.answer(
-                query=query,
-                uploaded_context=upload_context,
-                context_prefix=context_prefix_base,
-            )
-            if (fallback.get("response") or "").strip().lower() != "dont have an answer":
-                return fallback, "uploaded_document_agent_admin_fallback"
-
-        return result, "memory_answering_agent"
+        if has_upload and forced_intent == "knowledge":
+            return result, "memory_answering_agent_knowledge_upload"
+        if has_upload and forced_intent == "general":
+            return result, "memory_answering_agent_general_upload"
+        if forced_intent == "knowledge":
+            return result, "memory_answering_agent_knowledge_only"
+        return result, "memory_answering_agent_general_only"
 
     @staticmethod
     def _with_doc_scope(
@@ -179,10 +144,6 @@ class ChatOrchestrator:
     def _is_upload_specific_query(query: str) -> bool:
         text = (query or "").strip().lower()
         if not text:
-            return False
-
-        # Formatting/structure conversions should not be hijacked by upload routing.
-        if ChatOrchestrator._is_transformation_query(query):
             return False
 
         summary_markers = [
@@ -228,6 +189,9 @@ class ChatOrchestrator:
         text = (query or "").strip().lower()
         if not text:
             return False
+        has_upload_marker = bool(
+            re.search(r"\b(pdf|uploaded|upload|document|file|attached|chapter|page|section)\b", text)
+        )
         has_transform_verb = bool(
             re.search(
                 r"\b(make|convert|reformat|transform|rewrite|summari[sz]e|shorten|simplify|format|structure)\b",
@@ -245,4 +209,118 @@ class ChatOrchestrator:
             and ("\n" in text or len(text) > 220)
             and has_target_format
         )
-        return (has_transform_verb and has_reference) or (has_transform_verb and has_target_format) or has_inline_source
+        if has_inline_source:
+            return True
+        # If query is explicitly about uploaded PDF/file content, treat it as QA unless
+        # user clearly references transforming prior assistant output.
+        if has_upload_marker and not has_reference:
+            return False
+        return (has_transform_verb and has_reference) or (has_transform_verb and has_target_format and not has_upload_marker)
+
+    @staticmethod
+    def _is_explicit_pdf_query(query: str) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+        return bool(re.search(r"\bpdf\b", text))
+
+    @staticmethod
+    def _is_pdf_question(query: str, thread_messages: Optional[List[Dict]] = None) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+        if ChatOrchestrator._is_explicit_pdf_query(query):
+            return True
+        if ChatOrchestrator._is_upload_specific_query(query):
+            return True
+        # Pronoun-heavy follow-ups in an upload thread are usually PDF-scoped.
+        if re.search(r"\b(this|that|it|above|from this|from that)\b", text):
+            recent_user = [
+                (m.get("content") or "").strip().lower()
+                for m in (thread_messages or [])
+                if (m.get("role") or "").strip().lower() == "user" and (m.get("content") or "").strip()
+            ]
+            if recent_user:
+                return True
+        return False
+
+    @staticmethod
+    def _is_general_knowledge_query(query: str, thread_messages: Optional[List[Dict]] = None) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+
+        upload_markers = [
+            "pdf",
+            "uploaded",
+            "upload",
+            "document",
+            "file",
+            "attached",
+            "chapter",
+            "page",
+            "section",
+            "this",
+            "that",
+            "above",
+            "from here",
+        ]
+        if any(marker in text for marker in upload_markers):
+            return False
+
+        if ChatOrchestrator._is_transformation_query(query):
+            return False
+
+        explicit_general_markers = [
+            "in general",
+            "generally",
+            "general knowledge",
+            "overall concept",
+            "what is",
+            "define ",
+            "explain ",
+            "difference between",
+        ]
+        if any(marker in text for marker in explicit_general_markers):
+            return True
+
+        # Follow-up pronouns should stay upload-aware if conversation is ongoing.
+        if re.search(r"\b(it|this|that|they|those|these)\b", text):
+            recent_user = [
+                (m.get("content") or "").strip()
+                for m in (thread_messages or [])
+                if (m.get("role") or "").strip().lower() == "user" and (m.get("content") or "").strip()
+            ]
+            if recent_user:
+                return False
+
+        question_starts_general = bool(
+            re.search(r"^\s*(what|why|how|who|when|where)\b", text)
+        )
+        return question_starts_general
+
+    @staticmethod
+    def _classify_pro_route(query: str, thread_messages: Optional[List[Dict]] = None) -> str:
+        """
+        Returns:
+        - "pdf_only" when the question is clearly about uploaded file details
+        - "hybrid" otherwise (uploaded evidence + indexed knowledge)
+        """
+        text = (query or "").strip().lower()
+        if not text:
+            return "hybrid"
+
+        if ChatOrchestrator._is_upload_specific_query(query):
+            return "pdf_only"
+
+        # Pronoun-heavy follow-ups in an upload thread are usually PDF-scoped.
+        if re.search(r"\b(this|that|it|above|from this|from that)\b", text):
+            recent_user = [
+                (m.get("content") or "").strip().lower()
+                for m in (thread_messages or [])
+                if (m.get("role") or "").strip().lower() == "user" and (m.get("content") or "").strip()
+            ]
+            if recent_user:
+                return "pdf_only"
+
+        return "hybrid"

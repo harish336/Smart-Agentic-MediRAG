@@ -8,7 +8,9 @@ export const askQuestion = async ({
   query,
   thread_id = null,
   query_mode = "fast",
+  intent_policy = "",
   upload_ids = [],
+  has_uploaded_pdf = null,
   user_message_meta = null,
   thread_messages = [],
   rewrite_from_message_id = "",
@@ -19,6 +21,14 @@ export const askQuestion = async ({
     if (!query) {
       throw new Error("Query is required");
     }
+    console.debug("[api.askQuestion] request", {
+      thread_id,
+      query_mode,
+      intent_policy,
+      upload_ids_count: Array.isArray(upload_ids) ? upload_ids.length : 0,
+      thread_messages_count: Array.isArray(thread_messages) ? thread_messages.length : 0,
+      agent_hint,
+    });
 
     const response = await api.post(
       "/chat/ask",
@@ -26,7 +36,12 @@ export const askQuestion = async ({
         query,
         thread_id,
         query_mode,
+        intent_policy,
         upload_ids,
+        has_uploaded_pdf:
+          typeof has_uploaded_pdf === "boolean"
+            ? has_uploaded_pdf
+            : (Array.isArray(upload_ids) && upload_ids.length > 0),
         user_message_meta,
         thread_messages,
         rewrite_from_message_id: rewrite_from_message_id || "",
@@ -34,6 +49,12 @@ export const askQuestion = async ({
       },
       { signal }
     );
+    console.debug("[api.askQuestion] response", {
+      thread_id: response?.data?.thread_id,
+      agent_used: response?.data?.agent_used,
+      query_mode: response?.data?.query_mode,
+      citations_count: Array.isArray(response?.data?.citations) ? response.data.citations.length : 0,
+    });
 
     return response.data;
 

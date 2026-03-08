@@ -139,8 +139,13 @@ class FullIngestionPipeline:
                 chunk["doc_id"] = self.doc_id
 
             chunks = self.clean_chunks(chunks)
-            self.store_vector(chunks)
-            self.store_graph(chunks)
+
+            # Concurrent database storage
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                vec_future = executor.submit(self.store_vector, chunks)
+                graph_future = executor.submit(self.store_graph, chunks)
+                vec_future.result()
+                graph_future.result()
 
             logger.info("\n" + "=" * 100)
             logger.info("FULL INGESTION COMPLETED SUCCESSFULLY")

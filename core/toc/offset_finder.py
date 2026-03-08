@@ -129,8 +129,12 @@ class OffsetFinder:
             self.load_pdf()
 
             page_candidates = {}
+            
+            # Optimization: Offset is established in the front matter.
+            # Do not scan the entire book.
+            max_scan = min(50, self.doc.page_count)
 
-            for phys in range(self.doc.page_count):
+            for phys in range(max_scan):
                 page = self.doc.load_page(phys)
                 nums = self.extract_page_numbers(page)
                 if nums:

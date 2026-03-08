@@ -30,7 +30,7 @@ class RetrieverOrchestrator:
             system_config = get_system_config()
             self.fail_soft = system_config["project"].get("fail_soft", True)
             self.max_query_variants = int(
-                system_config.get("retrieval", {}).get("query_variants", 3)
+                system_config.get("retrieval", {}).get("query_variants", 1)
             )
 
             logger.info("RetrieverOrchestrator Ready")
@@ -341,6 +341,9 @@ class RetrieverOrchestrator:
 
             if requested_types and page_type in requested_types:
                 score += 0.12
+            elif not requested_types and page_type == "toc":
+                # Demote TOC blocks for general semantic questions to avoid LLM hallucinating summaries
+                score -= 0.15
 
             item["score"] = score
             boosted.append(item)
