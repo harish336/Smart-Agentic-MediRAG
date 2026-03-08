@@ -140,10 +140,10 @@ Determine if the given page is a Table of Contents page.
 
 Return ONLY valid JSON:
 
-{
+{{
   "is_toc": true or false,
   "toc_type": "OFFSET_TOC" or "STRUCTURE_TOC" or null
-}
+}}
 
 Rules:
 - OFFSET_TOC = page numbers visible

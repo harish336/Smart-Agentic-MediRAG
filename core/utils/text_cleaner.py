@@ -5,6 +5,7 @@ Text Cleaner (Standalone & Verbose)
 import sys
 import json
 import re
+import logging
 from pprint import pformat
 from typing import List
 
@@ -62,8 +63,9 @@ class TextCleaner:
     def clean(self, text: str) -> str:
 
         try:
-            logger.info("TEXT CLEANING STARTED")
-            logger.info(f"Input length: {len(text)}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("TEXT CLEANING STARTED")
+                logger.debug("Input length: %s", len(text))
 
             text = self.remove_non_printable(text)
             text = self.fix_hyphenated_words(text)
@@ -75,8 +77,9 @@ class TextCleaner:
                 text = self.aggressive_cleanup(text)
                 text = self.normalize_whitespace(text)
 
-            logger.info(f"Output length: {len(text)}")
-            logger.info("TEXT CLEANING COMPLETED")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Output length: %s", len(text))
+                logger.debug("TEXT CLEANING COMPLETED")
 
             return text
 

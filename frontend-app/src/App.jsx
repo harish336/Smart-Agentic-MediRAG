@@ -12,12 +12,13 @@ import {
 } from "./api/auth";
 import * as answerApi from "./api/answer";
 import {
-  adminIngestFiles,
   bulkDeleteIngestedDocuments,
   deleteIngestedDocument,
   fetchAdminStatistics,
+  getAdminIngestionJob,
   listIngestedDocuments,
   retrieveChunksForVerification,
+  startAdminIngestionJob,
 } from "./api/admin";
 
 const { askQuestion, deleteChatUpload, deleteThread, listChatUploads, listThreadMessages, listThreads, uploadChatFiles } = answerApi;
@@ -159,6 +160,168 @@ function threadDisplayName(thread) {
   return title || thread.id;
 }
 
+function isMarkdownTableSeparatorRow(line) {
+  const text = String(line || "").trim();
+  if (!text.includes("-")) return false;
+  if (!text.includes("|")) return false;
+  return /^(\|?\s*:?-{3,}:?\s*){2,}\|?$/.test(text);
+}
+
+function normalizePipeStructuredContent(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return "";
+
+  if (raw.split("\n").some((line) => isMarkdownTableSeparatorRow(line))) {
+    return raw;
+  }
+
+  const splitCells = (line) => {
+    let core = String(line || "").trim();
+    if (!core.includes("|")) return [];
+    if (core.startsWith("|")) core = core.slice(1);
+    if (core.endsWith("|")) core = core.slice(0, -1);
+    return core.split("|").map((part) => part.trim());
+  };
+
+  const candidateRows = raw
+    .replace(/\n\|\s*\|/g, "\n||")
+    .split(/\s*\|\|\s*|\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line.includes("|"))
+    .map((line) => splitCells(line).filter((cell) => cell.length > 0))
+    .filter((cells) => cells.length >= 2);
+
+  if (candidateRows.length < 2) return raw;
+
+  const rows = candidateRows.map((row) => [
+    String(row[0] ?? "").trim(),
+    String(row.slice(1).join(" | ") ?? "").trim(),
+  ]);
+
+  const firstRow = rows[0].map((cell) => cell.toLowerCase());
+  const hasHeaderHint = firstRow.some((cell) =>
+    /(topic|section|field|aspect|title|description|detail|summary|item|name)/.test(cell)
+  );
+  const looksLikeHeader = hasHeaderHint;
+
+  const headers = looksLikeHeader
+    ? [rows[0][0], rows[0][1]]
+    : ["Aspect", "Details"];
+  const dataRows = looksLikeHeader ? rows.slice(1) : rows;
+  if (!dataRows.length) return raw;
+
+  const cleanCell = (value) =>
+    String(value || "")
+      .replace(/\s{2,}/g, " ")
+      .replace(/\s-\s+/g, " - ")
+      .replace(/\|/g, "\\|")
+      .trim();
+
+  const headerLine = `| ${headers.map(cleanCell).join(" | ")} |`;
+  const separatorLine = `| ${headers.map(() => "---").join(" | ")} |`;
+  const markdownRows = dataRows.map((row) => `| ${cleanCell(row[0])} | ${cleanCell(row[1])} |`);
+  return [headerLine, separatorLine, ...markdownRows].join("\n");
+}
+
+function applyOutsideCodeFences(text, transform) {
+  const parts = String(text || "").split(/(```[\s\S]*?```)/g);
+  return parts
+    .map((part, index) => (index % 2 === 1 ? part : transform(part)))
+    .join("");
+}
+
+function normalizeReferencesSection(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = [];
+  let inReferences = false;
+
+  for (const sourceLine of lines) {
+    const line = String(sourceLine || "");
+    const trimmed = line.trim();
+
+    if (/^(references?|sources?)\s*:?\s*$/i.test(trimmed)) {
+      if (out.length > 0 && out[out.length - 1].trim()) out.push("");
+      out.push("## References");
+      out.push("");
+      inReferences = true;
+      continue;
+    }
+
+    if (!inReferences) {
+      out.push(line);
+      continue;
+    }
+
+    if (!trimmed) {
+      out.push("");
+      continue;
+    }
+
+    if (/^#{1,6}\s+/.test(trimmed)) {
+      inReferences = false;
+      out.push(line);
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(trimmed)) {
+      out.push(trimmed.replace(/^[-*]\s+/, "- "));
+      continue;
+    }
+
+    if (/^https?:\/\//i.test(trimmed)) {
+      out.push(`- ${trimmed}`);
+      continue;
+    }
+
+    out.push(`- ${trimmed}`);
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeKeyValueLines(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = lines.map((line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return "";
+    if (/^(#{1,6}\s+|[-*]\s+|\d+\.\s+|\|)/.test(trimmed)) return line;
+
+    const match = trimmed.match(/^([A-Za-z][A-Za-z0-9 /&()'\-]{2,60}):\s+(.+)$/);
+    if (!match) return line;
+
+    const label = String(match[1] || "").trim();
+    const value = String(match[2] || "").trim();
+    if (label.split(/\s+/).length > 6 || value.length > 450) return line;
+
+    return `**${label}:** ${value}`;
+  });
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeDenseNarrative(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return "";
+  if (/```/.test(raw)) return raw;
+  if (/[|]/.test(raw)) return raw;
+  if (/^\s*(?:[-*]\s+|\d+\.\s+|#{1,6}\s+)/m.test(raw)) return raw;
+  if (raw.length < 360) return raw;
+
+  const sentences = raw
+    .split(/(?<=[.!?])\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (sentences.length < 5) return raw;
+  return sentences.map((sentence) => `- ${sentence}`).join("\n");
+}
+
 function formatAssistantContent(content) {
   const text = typeof content === "string" ? content : "";
 
@@ -168,27 +331,535 @@ function formatAssistantContent(content) {
     .replace(/\\r/g, "\n")
     .replace(/\\t/g, "\t");
 
-  const normalized = unescaped
-    .replace(/\r\n/g, "\n")
-    .replace(/([^\n])\n(#{1,6}\s)/g, "$1\n\n$2")
-    .replace(/([^\n])\n([-\*]\s|\d+\.\s)/g, "$1\n\n$2") 
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const normalized = applyOutsideCodeFences(unescaped, (segment) =>
+    normalizeDenseNarrative(
+      normalizeKeyValueLines(
+        normalizeReferencesSection(
+          normalizeListTrailingNarrative(
+            normalizeDashDelimitedNarrative(
+              expandColonDelimitedNestedBullets(
+                normalizeInlineSectionBullets(
+                  normalizePipeDelimitedBullets(
+                    repairSparseTwoColumnTables(
+                      flattenSingleColumnBulletTables(
+                        normalizePipeStructuredContent(
+                          normalizeMarkdownListIndentation(
+                            normalizeListHierarchy(
+                              normalizeInlineNumberedLists(
+                                expandColonDelimitedNestedBullets(normalizeUnicodeBullets(segment))
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+      .replace(/\r\n/g, "\n")
+      .replace(/[ \t]*-{8,}[ \t]*/g, "\n\n---\n\n")
+      .replace(/(^|\n)(#{1,6}[^\n]*)\n(?!\n)/g, "$1$2\n\n")
+      .replace(/(^|\n)---\n(?!\n)/g, "$1---\n\n")
+      .replace(/([^\n])\n(#{1,6}\s)/g, "$1\n\n$2")
+      .replace(/([^\n])\n([-\*]\s|\d+\.\s)/g, "$1\n\n$2")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
 
-  const tableRowFixed = normalized.replace(/\s\|\s\|(?=\s*[-:\w])/g, " |\n|");
-
-  if (!tableRowFixed) return "No response.";
-  if (tableRowFixed.toLowerCase() === "dont have an answer") {
+  const finalContent = String(normalized || "").trim();
+  if (!finalContent) return "No response.";
+  if (finalContent.toLowerCase() === "dont have an answer") {
     return "I don't have enough reliable context to answer that yet. Please share a bit more detail.";
   }
 
-  return tableRowFixed;
+  return finalContent;
+}
+
+function normalizeListTrailingNarrative(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = [];
+  const listLinePattern = /^(\s*(?:[-*]|\d+\.)\s+)(.+)$/;
+  const narrativeStartPattern =
+    /\s+(?=(The|This|These|Those|It|Overall|However|In summary|Additionally|Also)\b)/;
+
+  for (const sourceLine of lines) {
+    const line = String(sourceLine || "");
+    const match = line.match(listLinePattern);
+    if (!match) {
+      out.push(line);
+      continue;
+    }
+
+    const [, prefix, body] = match;
+    const compactBody = body.replace(/\s+/g, " ").trim();
+    if (!compactBody || compactBody.length < 120) {
+      out.push(line);
+      continue;
+    }
+
+    const split = compactBody.split(narrativeStartPattern, 2);
+    if (split.length < 2) {
+      out.push(line);
+      continue;
+    }
+
+    const head = split[0].trim();
+    const tail = compactBody.slice(head.length).trim();
+    if (!head || !tail || tail.length < 45) {
+      out.push(line);
+      continue;
+    }
+
+    // Keep continuation inside list hierarchy (never emit detached paragraphs).
+    out.push(`${prefix}${head}`);
+    const leadingIndent = (prefix.match(/^\s*/) || [""])[0];
+    const isOrdered = /^\s*\d+\.\s+$/.test(prefix);
+    if (isOrdered) {
+      out.push(`${leadingIndent}   - ${tail}`);
+    } else {
+      out.push(`${leadingIndent}- ${tail}`);
+    }
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeInlineNumberedLists(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = [];
+  const markerPattern = /\b\d+\.\s+/g;
+
+  for (const sourceLine of lines) {
+    const line = String(sourceLine || "");
+    const trimmed = line.trim();
+    if (!trimmed) {
+      out.push(line);
+      continue;
+    }
+
+    if (trimmed.includes("|") || /^[-*+]\s+/.test(trimmed)) {
+      out.push(line);
+      continue;
+    }
+
+    const matches = Array.from(line.matchAll(markerPattern));
+    if (matches.length < 2) {
+      out.push(line);
+      continue;
+    }
+
+    const prefix = line.slice(0, matches[0].index).trim();
+    if (prefix) out.push(prefix);
+
+    for (let i = 0; i < matches.length; i += 1) {
+      const start = matches[i].index ?? 0;
+      const end = i + 1 < matches.length ? (matches[i + 1].index ?? line.length) : line.length;
+      const segment = line.slice(start, end).trim();
+      if (segment) out.push(segment);
+    }
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function flattenSingleColumnBulletTables(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return "";
+
+  const tables = parseMarkdownTables(raw);
+  if (!tables.length) return raw;
+
+  const lines = raw.split("\n");
+  const chunks = [];
+  let cursor = 0;
+
+  for (const table of tables) {
+    if (table.startLine > cursor) {
+      chunks.push(lines.slice(cursor, table.startLine).join("\n"));
+    }
+
+    const headers = Array.isArray(table.headers) ? table.headers : [];
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    const header = String(headers[0] ?? "").trim();
+    const rowTexts = rows
+      .map((row) => String(row?.[0] ?? "").trim())
+      .filter(Boolean);
+    const bulletCount = rowTexts.filter((row) => /^[-*â€¢]\s+/.test(row)).length;
+    const shouldFlatten =
+      headers.length === 1 &&
+      rowTexts.length >= 2 &&
+      bulletCount >= Math.ceil(rowTexts.length * 0.6);
+
+    if (!shouldFlatten) {
+      chunks.push(lines.slice(table.startLine, table.endLine + 1).join("\n"));
+      cursor = table.endLine + 1;
+      continue;
+    }
+
+    const normalizedRows = rowTexts.map((row) => row.replace(/^[-*â€¢]\s+/, "- "));
+    const flattened = [
+      header ? `**${header}**` : "",
+      header ? "" : "",
+      ...normalizedRows,
+    ]
+      .filter((line, idx, arr) => !(line === "" && idx === 0 && arr[idx + 1] === ""))
+      .join("\n")
+      .trim();
+
+    chunks.push(flattened);
+    cursor = table.endLine + 1;
+  }
+
+  if (cursor < lines.length) {
+    chunks.push(lines.slice(cursor).join("\n"));
+  }
+
+  return chunks.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeListHierarchy(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const normalized = [];
+  const normalizeIndentChars = (indent) =>
+    String(indent || "")
+      .replace(/\t/g, "    ")
+      .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+
+  const isListLine = (line) => /^(\s*)([-*+]|\d+\.)\s+/.test(String(line || ""));
+  const normalizeIndent = (line) => {
+    const value = String(line || "");
+    const m = value.match(/^(\s*)(.*)$/);
+    if (!m) return value;
+    const spaces = normalizeIndentChars(m[1]);
+    return `${spaces}${m[2]}`;
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const current = normalizeIndent(lines[i]);
+    const trimmed = current.trim();
+
+    if (!trimmed) {
+      const prev = normalized.length > 0 ? normalized[normalized.length - 1] : "";
+      let nextIndex = i + 1;
+      while (nextIndex < lines.length && !String(lines[nextIndex] || "").trim()) nextIndex += 1;
+      const next = nextIndex < lines.length ? normalizeIndent(lines[nextIndex]) : "";
+
+      if (isListLine(prev) && isListLine(next)) {
+        continue;
+      }
+      normalized.push("");
+      continue;
+    }
+
+    normalized.push(current);
+  }
+
+  return normalized.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeMarkdownListIndentation(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const listPattern = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+  const normalizeIndentChars = (indent) =>
+    String(indent || "")
+      .replace(/\t/g, "    ")
+      .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+
+  const indents = [];
+  for (const line of lines) {
+    const m = String(line || "").match(listPattern);
+    if (!m) continue;
+    const indentLen = normalizeIndentChars(m[1]).length;
+    indents.push(indentLen);
+  }
+
+  if (indents.length < 2) return raw.trim();
+
+  const unique = Array.from(new Set(indents)).sort((a, b) => a - b);
+  if (unique.length < 2) return raw.trim();
+
+  const levelByIndent = new Map(unique.map((indent, idx) => [indent, idx]));
+  const out = lines.map((line) => {
+    const m = String(line || "").match(listPattern);
+    if (!m) return line;
+    const indentLen = normalizeIndentChars(m[1]).length;
+    const level = Math.max(0, levelByIndent.get(indentLen) ?? 0);
+    return `${"    ".repeat(level)}${m[2]} ${m[3]}`;
+  });
+
+  return out.join("\n").trim();
+}
+
+function normalizeUnicodeBullets(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(
+      /(^|\n)(\s*)[\u2022\u25CF\u25E6\u25AA\u25AB\u2023\u2219\u00B7\u0095]\s+/g,
+      "$1$2- "
+    );
+}
+function expandColonDelimitedNestedBullets(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = [];
+  const bulletWithInlineChildren = /^(\s*[-*+]\s+)([^:\n]{2,180}):\s+-\s+(.+)$/;
+
+  for (const line of lines) {
+    const normalized = String(line || "");
+    const match = normalized.match(bulletWithInlineChildren);
+    if (!match) {
+      out.push(normalized);
+      continue;
+    }
+
+    const [, prefix, heading, remainder] = match;
+    const indent = (prefix.match(/^\s*/) || [""])[0].replace(/\t/g, "    ");
+    const children = String(remainder || "")
+      .split(/\s+-\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (children.length === 0) {
+      out.push(normalized);
+      continue;
+    }
+
+    out.push(`${indent}- ${heading.trim()}:`);
+    for (const child of children) out.push(`${indent}    - ${child}`);
+  }
+
+  return out.join("\n").trim();
+}
+
+function normalizeDashDelimitedNarrative(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = [];
+
+  for (const sourceLine of lines) {
+    const line = String(sourceLine || "");
+    const trimmed = line.trim();
+    if (!trimmed) {
+      out.push("");
+      continue;
+    }
+
+    const isLikelyMarkdown = trimmed.includes("|") || /^[-*]\s+/.test(trimmed) || /^\d+\.\s+/.test(trimmed);
+    if (isLikelyMarkdown || !trimmed.includes(" - ") || trimmed.length < 180) {
+      out.push(line);
+      continue;
+    }
+
+    const parts = trimmed.split(/\s+-\s+/).map((part) => part.trim()).filter(Boolean);
+    if (parts.length < 4) {
+      out.push(line);
+      continue;
+    }
+
+    out.push(parts[0]);
+    out.push("");
+    for (const part of parts.slice(1)) out.push(`- ${part}`);
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function normalizeInlineSectionBullets(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  if (!raw) return "";
+
+  const lines = raw.split("\n");
+  const out = [];
+  const bulletLine = /^(\s*)[-*]\s+(.+)$/;
+  const segmentSplitter = /\s+(?:-|–|—)\s+/g;
+  const cleanHeadingToken = (value) =>
+    String(value || "")
+      .trim()
+      .replace(/^\*\*(.+)\*\*$/u, "$1")
+      .replace(/\s*:\s*$/u, "")
+      .trim();
+  const looksLikeSentence = (value) => /[.!?]\s*$/u.test(String(value || "").trim());
+  const isHeadingLike = (value) => {
+    const token = cleanHeadingToken(value);
+    if (!token || token.length > 90) return false;
+    if (looksLikeSentence(token)) return false;
+    if (!/^[A-Z]/u.test(token)) return false;
+    const words = token.split(/\s+/).filter(Boolean);
+    if (words.length < 1 || words.length > 12) return false;
+    if (/^\*\*.+\*\*$/u.test(String(value || "").trim())) return true;
+    const uppercaseWords = words.filter((word) => /^[A-Z0-9][A-Za-z0-9/,&()'-]*$/u.test(word)).length;
+    // Accept both title-like headings and acronym-heavy headings.
+    return uppercaseWords >= 1 || /^[A-Z\s/&()'-]+$/u.test(token);
+  };
+
+  for (const sourceLine of lines) {
+    const line = String(sourceLine || "");
+    const match = line.match(bulletLine);
+    if (!match) {
+      out.push(line);
+      continue;
+    }
+
+    const indent = match[1] || "";
+    const body = (match[2] || "").trim();
+    if (!/[\s](?:-|–|—)[\s]/.test(body)) {
+      out.push(line);
+      continue;
+    }
+
+    const broadParts = body
+      .split(segmentSplitter)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const headingLikeCount = broadParts.filter((part) => isHeadingLike(part)).length;
+    const shouldExpandBroadly =
+      broadParts.length >= 3 &&
+      body.length >= 120 &&
+      (headingLikeCount >= 2 || body.includes("**"));
+
+    if (shouldExpandBroadly) {
+      out.push(`${indent}- ${broadParts[0]}`);
+      for (let i = 1; i < broadParts.length; i += 1) {
+        const current = broadParts[i];
+        const next = broadParts[i + 1];
+        const nextWords = String(next || "").trim().split(/\s+/).filter(Boolean).length;
+        const nextLooksDescriptive =
+          /[.,;:)]\s*$/u.test(String(next || "").trim()) ||
+          nextWords >= 6 ||
+          String(next || "").trim().length >= 36;
+        const canPairWithNext =
+          isHeadingLike(current) &&
+          next &&
+          !isHeadingLike(next) &&
+          nextLooksDescriptive;
+
+        if (canPairWithNext) {
+          out.push(`${indent}    - ${cleanHeadingToken(current)}: ${next}`);
+          i += 1;
+          continue;
+        }
+
+        if (isHeadingLike(current)) {
+          out.push(`${indent}    - ${cleanHeadingToken(current)}`);
+          continue;
+        }
+
+        out.push(`${indent}    - ${current}`);
+      }
+      continue;
+    }
+
+    // Split only when the next segment looks like a titled section: "Label: ...".
+    const segments = body
+      .split(/\s+-\s+(?=[A-Z][^:\n]{1,80}:\s*)/g)
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (segments.length < 2) {
+      out.push(line);
+      continue;
+    }
+
+    out.push(`${indent}- ${segments[0]}`);
+    for (const segment of segments.slice(1)) {
+      out.push(`${indent}    - ${segment}`);
+    }
+  }
+
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+function normalizePipeDelimitedBullets(text) {
+  const lines = String(text || "").split("\n");
+  if (!lines.length) return "";
+
+  const output = [];
+  for (const line of lines) {
+    const match = line.match(/^(\s*[-*]\s+)(.+)$/);
+    if (!match) {
+      output.push(line);
+      continue;
+    }
+
+    const [, prefix, body] = match;
+    if (!body.includes("|")) {
+      output.push(line);
+      continue;
+    }
+
+    const parts = body.split("|").map((part) => part.trim()).filter(Boolean);
+    if (parts.length <= 1) {
+      output.push(line);
+      continue;
+    }
+
+    const indent = (prefix.match(/^\s*/) || [""])[0];
+    for (const part of parts) output.push(`${indent}- ${part}`);
+  }
+
+  return output.join("\n");
+}
+
+function flattenReactText(node) {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map((child) => flattenReactText(child)).join("");
+  if (node && typeof node === "object" && node.props && node.props.children !== undefined) {
+    return flattenReactText(node.props.children);
+  }
+  return "";
+}
+
+function splitStructuredCellItems(text) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return [];
+
+  let delimiter = "";
+  if (raw.includes(";")) delimiter = ";";
+  else if (raw.includes(" | ")) delimiter = "|";
+  else return [];
+
+  const items = raw
+    .split(delimiter)
+    .map((part) => part.trim().replace(/^[-*]\s+/, ""))
+    .filter(Boolean);
+
+  if (items.length < 2 || items.length > 10) return [];
+  if (items.some((item) => item.length > 180)) return [];
+  return items;
 }
 
 function countWords(content) {
   const text = typeof content === "string" ? content.trim() : "";
   if (!text) return 0;
   return text.split(/\s+/).filter(Boolean).length;
+}
+
+function formatSeconds(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const mins = Math.floor(seconds / 60);
+  const rem = seconds % 60;
+  if (mins <= 0) return `${rem}s`;
+  return `${mins}m ${rem}s`;
 }
 
 const CHAT_CANVAS_WORD_THRESHOLD = 300;
@@ -214,7 +885,36 @@ function makeCanvasPreview(content, previewWords = CHAT_CANVAS_PREVIEW_WORDS) {
   }
   const words = clean.split(/\s+/).filter(Boolean);
   if (words.length <= previewWords) return clean;
-  return `${words.slice(0, previewWords).join(" ")}\n\n${CHAT_CANVAS_PREVIEW_HINT}`;
+
+  const lines = clean.split("\n");
+  const previewLines = [];
+  let used = 0;
+
+  for (const rawLine of lines) {
+    const line = String(rawLine || "");
+    const lineWords = line.trim() ? line.trim().split(/\s+/).length : 0;
+    if (used + lineWords <= previewWords) {
+      previewLines.push(line);
+      used += lineWords;
+      continue;
+    }
+
+    if (lineWords === 0) {
+      previewLines.push(line);
+      continue;
+    }
+
+    const remaining = Math.max(0, previewWords - used);
+    if (remaining > 0) {
+      const trimmedWords = line.trim().split(/\s+/).slice(0, remaining);
+      const isMarkdownPrefix = /^(\s*[-*]\s+|\s*\d+\.\s+|\s*#{1,6}\s+)/.test(line);
+      previewLines.push(isMarkdownPrefix ? line : `${trimmedWords.join(" ")}...`);
+    }
+    break;
+  }
+
+  const previewText = previewLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return `${previewText}\n\n${CHAT_CANVAS_PREVIEW_HINT}`;
 }
 
 function buildFinalQueryByMode(query, mode) {
@@ -223,7 +923,47 @@ function buildFinalQueryByMode(query, mode) {
   if (mode === "pro") {
     return /\bin book$/i.test(normalizedQuery) ? normalizedQuery : `${normalizedQuery} in book`;
   }
-  return normalizedQuery;
+  return normalizedQuery.replace(/\s+in\s+book\s*$/i, "").trim();
+}
+
+function normalizeAttachedFiles(files) {
+  return (Array.isArray(files) ? files : [])
+    .map((file) => ({
+      name: String(file?.name || file?.original_name || "").trim(),
+      type: String(file?.type || file?.media_type || "").trim(),
+      uploadId: String(file?.uploadId || file?.upload_id || file?.id || "").trim(),
+    }))
+    .filter((file) => file.name.length > 0);
+}
+
+function hydrateThreadMessages(rows) {
+  return (Array.isArray(rows) ? rows : []).map((msg) => {
+    const metadata = msg?.metadata && typeof msg.metadata === "object" ? msg.metadata : {};
+    const attachedFiles = normalizeAttachedFiles(msg?.attachedFiles || metadata?.attached_files || []);
+    const uploadIdsFromMessage = Array.isArray(msg?.uploadIdsUsed) ? msg.uploadIdsUsed : [];
+    const uploadIdsFromMeta = Array.isArray(metadata?.upload_ids) ? metadata.upload_ids : [];
+    const uploadIdsUsed = uploadIdsFromMessage.length > 0 ? uploadIdsFromMessage : uploadIdsFromMeta;
+    return {
+      ...msg,
+      attachedFiles,
+      uploadIdsUsed: Array.from(new Set(uploadIdsUsed.map((id) => String(id || "").trim()).filter(Boolean))),
+    };
+  });
+}
+
+function buildThreadMessagesPayload(messages) {
+  const sanitized = (Array.isArray(messages) ? messages : [])
+    .filter((msg) => {
+      const role = String(msg?.role || "").toLowerCase();
+      const content = String(msg?.fullContent || msg?.content || "").trim();
+      if (!content) return false;
+      return role === "user" || role === "assistant";
+    })
+    .map((msg) => ({
+      role: String(msg.role || "").toLowerCase(),
+      content: String(msg.fullContent || msg.content || "").trim(),
+    }));
+  return sanitized.slice(-8);
 }
 
 function parseMarkdownTableLine(line) {
@@ -289,6 +1029,127 @@ function parseMarkdownTables(text) {
   return tables;
 }
 
+function splitNarrativeTableCell(cellValue) {
+  const raw = String(cellValue || "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+
+  const stripped = raw.replace(
+    /^(here is your previous answer(?:[^:]{0,120})?:)\s*/i,
+    ""
+  );
+
+  const colonMatch = stripped.match(/^(.{3,90}?):\s+(.{10,})$/);
+  if (colonMatch) return [colonMatch[1].trim(), colonMatch[2].trim()];
+
+  const dashMatch = stripped.match(/^(.{3,120}?)\s+-\s+(.{10,})$/);
+  if (dashMatch) return [dashMatch[1].trim(), dashMatch[2].trim()];
+
+  return null;
+}
+
+function repairSparseTwoColumnTables(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return "";
+
+  const tables = parseMarkdownTables(raw);
+  if (!tables.length) return raw;
+
+  const lines = raw.split("\n");
+  const chunks = [];
+  let cursor = 0;
+
+  for (const table of tables) {
+    if (table.startLine > cursor) {
+      chunks.push(lines.slice(cursor, table.startLine).join("\n"));
+    }
+
+    let headers = Array.isArray(table.headers) ? [...table.headers] : [];
+    const rows = Array.isArray(table.rows) ? table.rows.map((row) => [...row]) : [];
+    let repaired = false;
+    let sectionHeading = "";
+
+    if (headers.length === 2) {
+      const introHeader = String(headers[0] ?? "").trim();
+      const titleHeader = String(headers[1] ?? "").trim();
+      if (/^\s*(?:here(?:'s| is)\s+)?(?:the\s+)?(?:formatted\s+)?response(?:\s+as)?\s+a?\s*markdown\s+table:?\s*$/i.test(introHeader) && titleHeader) {
+        headers = ["Aspect", "Details"];
+        sectionHeading = `## ${titleHeader}`;
+        repaired = true;
+      }
+
+      const normalizedRows = [];
+      let pendingHeading = "";
+      let pendingItems = [];
+      const flushPending = () => {
+        if (!pendingHeading) return;
+        normalizedRows.push([pendingHeading, pendingItems.join("; ").trim()]);
+        pendingHeading = "";
+        pendingItems = [];
+      };
+
+      for (const row of rows) {
+        const rawAspect = String(row[0] ?? "").trim();
+        const rawDetails = String(row[1] ?? "").trim();
+        if (!rawAspect && !rawDetails) continue;
+
+        const isAspectBullet = /^[-*â€¢]\s+/.test(rawAspect);
+        let aspect = rawAspect.replace(/^[-*â€¢]\s+/, "").trim().replace(/:\s*$/, "");
+        let details = rawDetails.replace(/^[-*â€¢]\s+/, "").trim();
+
+        if (!details) {
+          const split = splitNarrativeTableCell(aspect);
+          if (split) {
+            aspect = split[0];
+            details = split[1];
+            repaired = true;
+          }
+        }
+
+        if (details) {
+          flushPending();
+          normalizedRows.push([aspect, details]);
+          continue;
+        }
+
+        if (!isAspectBullet) {
+          flushPending();
+          pendingHeading = aspect;
+          repaired = true;
+          continue;
+        }
+
+        if (pendingHeading) {
+          pendingItems.push(aspect);
+          repaired = true;
+        } else {
+          normalizedRows.push([aspect, ""]);
+        }
+      }
+
+      flushPending();
+      const repairedTable = buildMarkdownTable(headers, normalizedRows);
+      const repairedWithHeading = sectionHeading
+        ? `${sectionHeading}\n\n${repairedTable}`
+        : repairedTable;
+      chunks.push(
+        repaired
+          ? repairedWithHeading
+          : lines.slice(table.startLine, table.endLine + 1).join("\n")
+      );
+      cursor = table.endLine + 1;
+      continue;
+    }
+    chunks.push(lines.slice(table.startLine, table.endLine + 1).join("\n"));
+    cursor = table.endLine + 1;
+  }
+
+  if (cursor < lines.length) {
+    chunks.push(lines.slice(cursor).join("\n"));
+  }
+
+  return chunks.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function buildMarkdownTable(headers, rows) {
   const normalized = normalizeTableShape(headers, rows);
   const escapeCell = (value) => String(value ?? "").replace(/\|/g, "\\|").trim();
@@ -296,6 +1157,84 @@ function buildMarkdownTable(headers, rows) {
   const separatorLine = `| ${normalized.headers.map(() => "---").join(" | ")} |`;
   const rowLines = normalized.rows.map((row) => `| ${row.map(escapeCell).join(" | ")} |`);
   return [headerLine, separatorLine, ...rowLines].join("\n");
+}
+
+function convertNarrativeToAspectTable(text) {
+  const raw = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return raw;
+  if (parseMarkdownTables(raw).length > 0) return raw;
+
+  const lines = raw.split("\n").map((line) => String(line || "").trim()).filter(Boolean);
+  if (lines.length < 3) return raw;
+
+  // Keep authored section structure intact instead of forcing it into an Aspect/Details table.
+  const headingLikeLineCount = lines.filter((line) => /^#{1,6}\s+\S+/.test(line) || /^\d+\.\s+\S+/.test(line)).length;
+  if (headingLikeLineCount >= 2) return raw;
+
+  const rows = [];
+  const preface = [];
+  let startedSections = false;
+  let currentAspect = "";
+  let currentDetails = [];
+
+  const flushCurrent = () => {
+    const aspect = String(currentAspect || "").trim();
+    const detail = currentDetails.join("; ").replace(/\s{2,}/g, " ").trim();
+    if (!aspect || !detail) return;
+    rows.push([aspect, detail]);
+    currentAspect = "";
+    currentDetails = [];
+  };
+
+  for (const line of lines) {
+    if (!line || /^---+$/.test(line)) continue;
+    if (/^\[Open Canvas to view the full response\]$/i.test(line)) continue;
+
+    const headingMatch = line.match(/^\d+\.\s+(.+)/);
+    if (headingMatch) {
+      if (!startedSections && preface.length > 0) {
+        rows.push(["Overview", preface.join(" ").replace(/\s{2,}/g, " ").trim()]);
+        preface.length = 0;
+      }
+      startedSections = true;
+      flushCurrent();
+      currentAspect = headingMatch[1].trim();
+      continue;
+    }
+
+    const bulletMatch = line.match(/^[-*â€¢]\s+(.+)/);
+    if (bulletMatch) {
+      const bullet = bulletMatch[1].trim();
+      if (!startedSections) {
+        preface.push(bullet);
+      } else {
+        if (!currentAspect) currentAspect = "Details";
+        currentDetails.push(bullet);
+      }
+      continue;
+    }
+
+    if (!startedSections) {
+      preface.push(line.replace(/^#{1,6}\s+/, "").trim());
+      continue;
+    }
+
+    if (!currentAspect) currentAspect = "Details";
+    currentDetails.push(line);
+  }
+
+  flushCurrent();
+
+  if (!startedSections && preface.length > 0) {
+    rows.push(["Overview", preface.join(" ").replace(/\s{2,}/g, " ").trim()]);
+  }
+
+  const compactRows = rows
+    .map(([aspect, details]) => [String(aspect || "").trim(), String(details || "").trim()])
+    .filter(([aspect, details]) => aspect && details);
+
+  if (compactRows.length === 0) return raw;
+  return buildMarkdownTable(["Aspect", "Details"], compactRows);
 }
 
 function CitationBox({ citations, addToast }) {
@@ -482,7 +1421,7 @@ function AuthPanel({ onAuthSuccess, addToast }) {
                 </div>
                 <div className="group">
                   <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider ml-1 mb-2 block group-focus-within:text-emerald-400 transition-colors">Password</label>
-                  <input type="password" value={form.password} onChange={(e) => updateField("password", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 placeholder:text-slate-600 shadow-inner" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" />
+                  <input type="password" value={form.password} onChange={(e) => updateField("password", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 placeholder:text-slate-600 shadow-inner" placeholder="Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢" />
                 </div>
               </div>
               <button type="submit" disabled={loading} className="w-full rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-4 text-sm font-bold text-white shadow-[0_8px_25px_rgba(16,185,129,0.3)] hover:shadow-[0_12px_35px_rgba(16,185,129,0.4)] transition-all duration-300 active:scale-[0.98] disabled:opacity-50 mt-4 relative overflow-hidden group">
@@ -520,7 +1459,7 @@ function AuthPanel({ onAuthSuccess, addToast }) {
               </div>
               <div className="group">
                 <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider ml-1 mb-2 block group-focus-within:text-emerald-400 transition-colors">New Password</label>
-                <input type="password" value={form.newPassword} onChange={(e) => updateField("newPassword", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner" placeholder="â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢" />
+                <input type="password" value={form.newPassword} onChange={(e) => updateField("newPassword", e.target.value)} className="w-full rounded-2xl border border-slate-700/50 bg-slate-900/60 px-4 py-3.5 text-sm transition-all duration-300 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner" placeholder="Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢Ã¢â‚¬Â¢" />
               </div>
               <button type="submit" disabled={loading} className="w-full rounded-2xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-4 text-sm font-bold text-white shadow-[0_8px_25px_rgba(16,185,129,0.3)] hover:shadow-[0_12px_35px_rgba(16,185,129,0.4)] transition-all duration-300 active:scale-[0.98] disabled:opacity-50">
                 {loading ? "Updating..." : "Reset Password"}
@@ -629,6 +1568,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
   const [chatMode, setChatMode] = useState("fast");
   const [chatUploading, setChatUploading] = useState(false);
   const [chatUploadActionId, setChatUploadActionId] = useState("");
+  const [openingUploadId, setOpeningUploadId] = useState("");
   const [chatUploads, setChatUploads] = useState([]);
   const [pendingChatFiles, setPendingChatFiles] = useState([]);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -663,6 +1603,34 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
   const isAdmin = (user?.role || "") === "admin";
   const canvasTables = useMemo(() => parseMarkdownTables(canvasDraft), [canvasDraft]);
   const activeCanvasTable = canvasTables[canvasSelectedTableIndex] || null;
+  const markdownComponents = useMemo(
+    () => ({
+      table({ children, ...props }) {
+        return (
+          <div className="my-4 w-full max-w-full overflow-x-auto rounded-xl border border-slate-700/80">
+            <table {...props} className="w-full min-w-[680px] border-collapse table-auto text-[14px]">
+              {children}
+            </table>
+          </div>
+        );
+      },
+      td({ children, ...props }) {
+        const cellText = flattenReactText(children);
+        const items = splitStructuredCellItems(cellText);
+        if (items.length < 2) return <td {...props}>{children}</td>;
+        return (
+          <td {...props}>
+            <ul className="my-0 list-disc pl-5 space-y-1">
+              {items.map((item, idx) => (
+                <li key={`cell-item-${idx}`}>{item}</li>
+              ))}
+            </ul>
+          </td>
+        );
+      },
+    }),
+    []
+  );
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loadingAsk]);
 
@@ -766,7 +1734,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
 
   const openThread = async (id) => {
     if (editingThreadId === id) return; // Prevent opening while editing
-    try { setLoadingMessages(true); setThreadId(id); const data = await listThreadMessages(id); setMessages(data); } 
+    try { setLoadingMessages(true); setThreadId(id); const data = await listThreadMessages(id); setMessages(hydrateThreadMessages(data)); } 
     catch (error) { addToast(getErrorMessage(error, "Failed to load messages"), "error"); } 
     finally { setLoadingMessages(false); }
   };
@@ -867,12 +1835,53 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
     }
   };
 
-  const runChatUpload = async () => {
-    if (chatUploading || pendingChatFiles.length === 0) return;
+  const resolveAttachedUploadId = (attachedFile) => {
+    const directId = String(attachedFile?.uploadId || attachedFile?.upload_id || "").trim();
+    if (directId) return directId;
+    const targetName = String(attachedFile?.name || attachedFile?.original_name || "").trim().toLowerCase();
+    if (!targetName) return "";
+    const match = (Array.isArray(chatUploads) ? chatUploads : []).find(
+      (row) => String(row?.original_name || "").trim().toLowerCase() === targetName
+    );
+    return String(match?.id || "").trim();
+  };
+
+  const handleOpenAttachedUpload = async (attachedFile) => {
+    const uploadId = resolveAttachedUploadId(attachedFile);
+    if (!uploadId) {
+      addToast("Could not find uploaded file ID", "error");
+      return;
+    }
+
+    const popup = window.open("", "_blank");
+    if (!popup) {
+      addToast("Could not open a new tab. Please allow popups for this site.", "error");
+      return;
+    }
+    popup.document.title = "Loading uploaded file...";
+    popup.document.body.innerHTML = "<p style='font-family:sans-serif;padding:16px'>Loading file...</p>";
+
+    try {
+      setOpeningUploadId(uploadId);
+      const blob = await answerApi.fetchChatUploadBlob(uploadId);
+      const blobUrl = window.URL.createObjectURL(blob);
+      popup.location.replace(blobUrl);
+      window.setTimeout(() => window.URL.revokeObjectURL(blobUrl), 60000);
+    } catch (error) {
+      popup.close();
+      addToast(getErrorMessage(error, "Failed to open uploaded file"), "error");
+    } finally {
+      setOpeningUploadId("");
+    }
+  };
+
+  const runChatUpload = async (filesOverride = null) => {
+    const filesToUpload = Array.isArray(filesOverride) ? filesOverride : pendingChatFiles;
+    if (chatUploading || filesToUpload.length === 0) return;
     try {
       setChatUploading(true);
       const res = await uploadChatFiles({
-        files: pendingChatFiles,
+        files: filesToUpload,
         index: chatIndexEnabled,
         thread_id: threadId || null,
       });
@@ -882,7 +1891,9 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
         queued.forEach((item) => map.set(item.id, item));
         return Array.from(map.values());
       });
-      setPendingChatFiles([]);
+      if (!Array.isArray(filesOverride)) {
+        setPendingChatFiles([]);
+      }
       addToast(`Upload started: ${queued.length} file(s) in background`, "success");
       return queued;
     } catch (error) {
@@ -900,13 +1911,6 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
     }
     setLoadingAsk(false);
     addToast("Generation stopped", "success");
-  };
-
-  const buildUploadChatText = (files) => {
-    const list = Array.isArray(files) ? files : [];
-    if (list.length === 0) return "";
-    const lines = list.map((file) => `- ${file.name}`);
-    return `Uploaded document${list.length > 1 ? "s" : ""}:\n${lines.join("\n")}`;
   };
 
   const waitForUploadsToFinish = async (targetIds, timeoutMs = 90000, signal = null) => {
@@ -995,6 +1999,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
   const askWithQuery = async ({
     query,
     uploadIdsForQuestion = [],
+    userMessageMeta = null,
     askController,
     replaceAfterUserIndex = null,
     queryMode = "",
@@ -1004,7 +2009,10 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
     const res = await askQuestion({
       query,
       thread_id: threadId || null,
+      query_mode: queryMode || "fast",
       upload_ids: uploadIdsForQuestion,
+      user_message_meta: userMessageMeta,
+      thread_messages: buildThreadMessagesPayload(messages),
       rewrite_from_message_id: rewriteFromMessageId || "",
       agent_hint: agentHint || "",
       signal: askController.signal,
@@ -1116,9 +2124,9 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
       const finalQuery = buildFinalQueryByMode(nextQuestion, modeUsed);
       const uploadIdsFromMessage = Array.isArray(sourceMessage?.uploadIdsUsed) ? sourceMessage.uploadIdsUsed : [];
       const uploadIdsForQuestion = uploadIdsFromMessage.length > 0 ? uploadIdsFromMessage : readyUploadIds;
-      const agentHint =
-        String(sourceAssistant?.agentUsed || "").trim() ||
-        (uploadIdsForQuestion.length > 0 ? "uploaded_document_agent" : "memory_answering_agent");
+      const agentHint = uploadIdsForQuestion.length > 0
+        ? "uploaded_document_agent"
+        : (String(sourceAssistant?.agentUsed || "").trim() || "memory_answering_agent");
 
       setMessages((prev) => {
         const updated = [...prev];
@@ -1137,6 +2145,10 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
       await askWithQuery({
         query: finalQuery,
         uploadIdsForQuestion,
+        userMessageMeta: {
+          upload_ids: uploadIdsForQuestion,
+          attached_files: normalizeAttachedFiles(sourceMessage?.attachedFiles || []),
+        },
         askController,
         replaceAfterUserIndex: index,
         queryMode: modeUsed,
@@ -1171,9 +2183,9 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
     const uploadIdsFromMessage = Array.isArray(sourceMessage?.uploadIdsUsed) ? sourceMessage.uploadIdsUsed : [];
     const uploadIdsForQuestion = uploadIdsFromMessage.length > 0 ? uploadIdsFromMessage : readyUploadIds;
     const rewriteFromMessageId = String(sourceMessage?.id || "").trim();
-    const agentHint =
-      String(sourceAssistant?.agentUsed || "").trim() ||
-      (uploadIdsForQuestion.length > 0 ? "uploaded_document_agent" : "memory_answering_agent");
+    const agentHint = uploadIdsForQuestion.length > 0
+      ? "uploaded_document_agent"
+      : (String(sourceAssistant?.agentUsed || "").trim() || "memory_answering_agent");
     trimConversationAfterUser(index);
     setRegeneratingQuestionIndex(index);
     setLoadingAsk(true);
@@ -1198,6 +2210,10 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
       await askWithQuery({
         query: finalQuery,
         uploadIdsForQuestion,
+        userMessageMeta: {
+          upload_ids: uploadIdsForQuestion,
+          attached_files: normalizeAttachedFiles(sourceMessage?.attachedFiles || []),
+        },
         askController,
         replaceAfterUserIndex: index,
         queryMode: modeUsed,
@@ -1226,6 +2242,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
   const sendMessage = async () => {
     const query = input.trim();
     const selectedFiles = Array.isArray(pendingChatFiles) ? [...pendingChatFiles] : [];
+    const attachedFilesForMessage = normalizeAttachedFiles(selectedFiles);
     const hasFileSelection = selectedFiles.length > 0;
     if (loadingAsk) return;
     if (!query && !hasFileSelection) return;
@@ -1234,10 +2251,8 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
 
     setInput("");
     if (hasFileSelection) {
-      const uploadMessage = buildUploadChatText(selectedFiles);
-      if (uploadMessage) {
-        setMessages((prev) => [...prev, { role: "user", content: uploadMessage, isUploadMessage: true }]);
-      }
+      // Clear selected-file chips immediately after Enter.
+      setPendingChatFiles([]);
     }
     if (query) {
       setMessages((prev) => [
@@ -1250,23 +2265,13 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
           queryMode: chatMode,
           chatModeUsed: chatMode,
           uploadIdsUsed: [],
+          attachedFiles: attachedFilesForMessage,
         },
       ]);
     }
 
     if (!query && hasFileSelection) {
-      const queued = await runChatUpload();
-      const queuedCount = Array.isArray(queued) ? queued.length : 0;
-      if (queuedCount > 0) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "assistant",
-            content: `Received ${queuedCount} uploaded file(s). Ask your question and I will answer from these documents.`,
-            citations: [],
-          },
-        ]);
-      }
+      await runChatUpload(selectedFiles);
       return;
     }
 
@@ -1276,9 +2281,39 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
 
     try {
       let uploadIdsForQuestion = readyUploadIds;
+      let attachedFilesForMeta = normalizeAttachedFiles(selectedFiles);
 
-      if (pendingChatFiles.length > 0) {
-        const queued = await runChatUpload();
+      if (selectedFiles.length > 0) {
+        const queued = await runChatUpload(selectedFiles);
+        if (userMessageClientId) {
+          const queueByName = new Map();
+          (Array.isArray(queued) ? queued : []).forEach((item) => {
+            const key = String(item?.original_name || "").trim().toLowerCase();
+            if (!key) return;
+            const bucket = queueByName.get(key) || [];
+            bucket.push(item);
+            queueByName.set(key, bucket);
+          });
+          const nextAttachedFiles = normalizeAttachedFiles(selectedFiles).map((file) => {
+            const key = String(file?.name || "").trim().toLowerCase();
+            const bucket = queueByName.get(key) || [];
+            const matched = bucket.shift() || null;
+            queueByName.set(key, bucket);
+            return {
+              ...file,
+              uploadId: String(matched?.id || file.uploadId || "").trim(),
+              type: String(file?.type || matched?.media_type || "").trim(),
+            };
+          });
+          attachedFilesForMeta = nextAttachedFiles;
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg?.clientId === userMessageClientId
+                ? { ...msg, attachedFiles: nextAttachedFiles }
+                : msg
+            )
+          );
+        }
         if (askController.signal.aborted) return;
         const queuedIds = Array.isArray(queued) ? queued.map((item) => item?.id).filter(Boolean) : [];
         if (queuedIds.length > 0) {
@@ -1291,6 +2326,10 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
       await askWithQuery({
         query: finalQuery,
         uploadIdsForQuestion,
+        userMessageMeta: {
+          upload_ids: uploadIdsForQuestion,
+          attached_files: attachedFilesForMeta,
+        },
         askController,
         queryMode: chatMode,
       });
@@ -1567,12 +2606,12 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                       className="h-full min-h-[220px] w-full resize-none rounded-2xl border border-slate-700 bg-slate-950/70 p-5 text-sm leading-relaxed text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40"
                     />
                     <div className="h-full min-h-[220px] overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
-                      <div className="w-full text-[14px] leading-relaxed text-slate-200 
+                      <div className="w-full break-words text-[14px] leading-relaxed text-slate-200 
                         [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
-                        [&_p]:mb-4 
-                        [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
-                        [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
-                        [&_li::marker]:text-emerald-500 [&_li]:pl-1 
+                        [&_p]:mb-4 [&_p]:leading-7 [&_p]:whitespace-pre-wrap
+                        [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-7 [&_ul]:space-y-2 [&_li>ul]:mt-2 [&_li>ul]:ml-4 [&_li>ul]:pl-6 [&_ul_ul]:mt-2 [&_ul_ul]:mb-2 [&_ul_ul]:ml-4 [&_ul_ul]:pl-6 [&_ul_ul]:list-[circle] [&_ul_ul_ul]:mt-1 [&_ul_ul_ul]:ml-4 [&_ul_ul_ul]:pl-6 [&_ul_ul_ul]:list-[square]
+                        [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-7 [&_ol]:space-y-2 [&_li>ol]:mt-2 [&_li>ol]:ml-4 [&_li>ol]:pl-6 [&_ol_ol]:ml-4 [&_ol_ol]:pl-6
+                        [&_li::marker]:text-emerald-500 [&_li]:pl-1.5 
                         [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
                         [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
                         [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
@@ -1580,26 +2619,30 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                         [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
                         [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
                         [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
-                        [&_table]:my-4 [&_table]:w-full [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-sm
+                        [&_hr]:my-6 [&_hr]:border-slate-700/70
+                        [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-[14px] [&_table]:table-auto
                         [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
-                        [&_tr]:border-b [&_tr]:border-slate-800/80
-                        [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top
-                        [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2 [&_td]:text-slate-300 [&_td]:align-top
-                        [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto
+                        [&_tbody_tr:nth-child(even)]:bg-slate-900/20
+                        [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
+                        [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2.5 [&_td]:text-slate-300 [&_td]:align-top [&_td]:whitespace-normal [&_td]:break-words [&_td]:leading-6
+                        [&_th:nth-child(1)]:w-[32%] [&_td:nth-child(1)]:w-[32%]
+                        [&_th:nth-child(2)]:w-[68%] [&_td:nth-child(2)]:w-[68%]
                         [&_strong]:font-bold [&_strong]:text-white
                       ">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatAssistantContent(canvasDraft)}</ReactMarkdown>
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                          {formatAssistantContent(canvasDraft)}
+                        </ReactMarkdown>
                       </div>
                     </div>
                   </div>
                 ) : canvasView === "preview" ? (
                   <div className="h-full overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-5">
-                    <div className="w-full text-[14px] leading-relaxed text-slate-200 
+                    <div className="w-full break-words text-[14px] leading-relaxed text-slate-200 
                       [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
-                      [&_p]:mb-4 
-                      [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
-                      [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
-                      [&_li::marker]:text-emerald-500 [&_li]:pl-1 
+                      [&_p]:mb-4 [&_p]:leading-7 [&_p]:whitespace-pre-wrap
+                      [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-7 [&_ul]:space-y-2 [&_li>ul]:mt-2 [&_li>ul]:ml-4 [&_li>ul]:pl-6 [&_ul_ul]:mt-2 [&_ul_ul]:mb-2 [&_ul_ul]:ml-4 [&_ul_ul]:pl-6 [&_ul_ul]:list-[circle] [&_ul_ul_ul]:mt-1 [&_ul_ul_ul]:ml-4 [&_ul_ul_ul]:pl-6 [&_ul_ul_ul]:list-[square]
+                      [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-7 [&_ol]:space-y-2 [&_li>ol]:mt-2 [&_li>ol]:ml-4 [&_li>ol]:pl-6 [&_ol_ol]:ml-4 [&_ol_ol]:pl-6
+                      [&_li::marker]:text-emerald-500 [&_li]:pl-1.5 
                       [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
                       [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
                       [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
@@ -1607,15 +2650,19 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                       [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
                       [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
                       [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
-                      [&_table]:my-4 [&_table]:w-full [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-sm
+                      [&_hr]:my-6 [&_hr]:border-slate-700/70
+                      [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-[14px] [&_table]:table-auto
                       [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
-                      [&_tr]:border-b [&_tr]:border-slate-800/80
-                      [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top
-                      [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2 [&_td]:text-slate-300 [&_td]:align-top
-                      [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto
+                      [&_tbody_tr:nth-child(even)]:bg-slate-900/20
+                      [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
+                      [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2.5 [&_td]:text-slate-300 [&_td]:align-top [&_td]:whitespace-normal [&_td]:break-words [&_td]:leading-6
+                      [&_th:nth-child(1)]:w-[32%] [&_td:nth-child(1)]:w-[32%]
+                      [&_th:nth-child(2)]:w-[68%] [&_td:nth-child(2)]:w-[68%]
                       [&_strong]:font-bold [&_strong]:text-white
                     ">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{formatAssistantContent(canvasDraft)}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                        {formatAssistantContent(canvasDraft)}
+                      </ReactMarkdown>
                     </div>
                   </div>
                 ) : (
@@ -2031,6 +3078,8 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
             {messages.map((msg, index) => {
               const isUser = msg.role === "user";
               const isUploadMessage = Boolean(msg.isUploadMessage);
+              const userAttachedFiles = normalizeAttachedFiles(msg?.attachedFiles);
+              const hasAttachedFiles = isUser && userAttachedFiles.length > 0;
               const isEditingThisQuestion = isUser && !isUploadMessage && editingQuestionIndex === index;
               const assistantBubbleWidthClass = isUser
                 ? "max-w-[92%] md:max-w-[85%]"
@@ -2042,6 +3091,11 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                 Boolean(msg.canvasLinked) ||
                 String(assistantSourceContent).includes(CHAT_CANVAS_PREVIEW_HINT) ||
                 countWords(assistantSourceContent) > CHAT_CANVAS_WORD_THRESHOLD;
+              const hideCitationsForProUpload =
+                !isUser &&
+                String(msg?.queryMode || "").toLowerCase() === "pro" &&
+                Array.isArray(msg?.uploadIdsUsed) &&
+                msg.uploadIdsUsed.length > 0;
               const assistantRenderContent = assistantNeedsCanvasPreview
                 ? makeCanvasPreview(assistantSourceContent, CHAT_CANVAS_PREVIEW_WORDS)
                 : formatAssistantContent(assistantSourceContent);
@@ -2051,7 +3105,9 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                     <div
                       className={`relative rounded-[2rem] shadow-2xl ${
                       isUser
-                        ? isUploadMessage
+                        ? hasAttachedFiles
+                          ? "px-0 py-0 bg-transparent text-slate-100 rounded-tr-sm shadow-none border-0"
+                          : isUploadMessage
                           ? "px-6 py-5 bg-slate-900/95 text-slate-100 rounded-tr-sm shadow-[0_10px_30px_rgba(15,23,42,0.45)] border border-cyan-500/35"
                           : "px-6 py-5 bg-gradient-to-br from-emerald-500 to-teal-600 text-white rounded-tr-sm shadow-[0_10px_30px_rgba(16,185,129,0.2)] border border-emerald-400/30"
                         : `${canvasOpen ? "px-4 py-4" : "px-6 py-5"} bg-[#0b1016]/95 border border-slate-700/60 text-slate-200 rounded-tl-sm backdrop-blur-xl shadow-[0_10px_40px_rgba(0,0,0,0.4)]`
@@ -2097,17 +3153,54 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                               </div>
                             </div>
                           ) : (
-                            <div className="whitespace-pre-wrap leading-relaxed text-[15px] font-medium">{msg.content}</div>
+                            hasAttachedFiles ? (
+                              <div className="space-y-3">
+                                {userAttachedFiles.map((file, fileIndex) => (
+                                  <button
+                                    type="button"
+                                    key={`${file.name}-${file.type}-${fileIndex}`}
+                                    onClick={() => handleOpenAttachedUpload(file)}
+                                    className="min-w-[280px] rounded-2xl border border-slate-600/70 bg-[#1d2229]/95 px-4 py-3 text-left text-slate-100 shadow-[0_8px_24px_rgba(0,0,0,0.35)] transition-colors hover:bg-[#242b35]"
+                                    title="Click to open uploaded file"
+                                  >
+                                    <div className="flex items-center gap-3">
+                                      <div className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-rose-500 text-white">
+                                        <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 3v4a1 1 0 0 0 1 1h4M8 13h8M8 17h8M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" />
+                                        </svg>
+                                      </div>
+                                      <div className="min-w-0">
+                                        <div className="truncate text-[17px] font-semibold text-slate-100" title={file.name}>
+                                          {file.name}
+                                        </div>
+                                        <div className="text-[11px] font-medium uppercase tracking-wide text-slate-300/90">
+                                          {openingUploadId && openingUploadId === resolveAttachedUploadId(file) ? "Opening..." : "PDF"}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </button>
+                                ))}
+                                {String(msg.content || "").trim() && (
+                                  <div className="flex justify-end">
+                                    <div className="rounded-[1.65rem] rounded-tr-sm border border-emerald-400/30 bg-gradient-to-br from-emerald-500 to-teal-600 px-6 py-3 text-[14px] font-medium text-white shadow-[0_10px_30px_rgba(16,185,129,0.25)]">
+                                      {msg.content}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="whitespace-pre-wrap leading-relaxed text-[15px] font-medium">{msg.content}</div>
+                            )
                           )}
                         </div>
                       ) : (
                         <div className="flex flex-col gap-2 w-full overflow-hidden">
-                          <div className={`w-full overflow-x-auto text-[15px] leading-relaxed text-slate-200 
+                          <div className={`w-full overflow-x-auto break-words text-[15px] leading-relaxed text-slate-200 
                             [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 
-                            [&_p]:mb-4 
-                            [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-6 [&_ul]:space-y-2 
-                            [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-6 [&_ol]:space-y-2 
-                            [&_li::marker]:text-emerald-500 [&_li]:pl-1 
+                            [&_p]:mb-4 [&_p]:leading-7 [&_p]:whitespace-pre-wrap
+                            [&_ul]:mb-5 [&_ul]:list-disc [&_ul]:pl-7 [&_ul]:space-y-2 [&_li>ul]:mt-2 [&_li>ul]:ml-4 [&_li>ul]:pl-6 [&_ul_ul]:mt-2 [&_ul_ul]:mb-2 [&_ul_ul]:ml-4 [&_ul_ul]:pl-6 [&_ul_ul]:list-[circle] [&_ul_ul_ul]:mt-1 [&_ul_ul_ul]:ml-4 [&_ul_ul_ul]:pl-6 [&_ul_ul_ul]:list-[square]
+                            [&_ol]:mb-5 [&_ol]:list-decimal [&_ol]:pl-7 [&_ol]:space-y-2 [&_li>ol]:mt-2 [&_li>ol]:ml-4 [&_li>ol]:pl-6 [&_ol_ol]:ml-4 [&_ol_ol]:pl-6 
+                            [&_li::marker]:text-emerald-500 [&_li]:pl-1.5 
                             [&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mb-4 [&_h1]:text-white 
                             [&_h2]:text-xl [&_h2]:font-bold [&_h2]:mb-3 [&_h2]:text-white 
                             [&_h3]:text-lg [&_h2]:font-bold [&_h3]:mb-3 [&_h3]:text-white 
@@ -2115,20 +3208,24 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                             [&_code]:text-emerald-300 [&_code]:bg-slate-900/80 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px]
                             [&_pre]:bg-[#05090f] [&_pre]:p-4 [&_pre]:rounded-xl [&_pre]:overflow-x-auto [&_pre]:border [&_pre]:border-slate-800/80 [&_pre]:mb-4 
                             [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-slate-300 
-                            [&_table]:my-4 [&_table]:w-full [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-sm
+                            [&_hr]:my-6 [&_hr]:border-slate-700/70
+                            [&_table]:my-4 [&_table]:w-full [&_table]:min-w-[680px] [&_table]:border-collapse [&_table]:overflow-hidden [&_table]:rounded-xl [&_table]:border [&_table]:border-slate-700/80 [&_table]:text-[14px] [&_table]:table-auto
                             [&_thead]:bg-slate-900/80 [&_thead]:text-slate-200
-                            [&_tr]:border-b [&_tr]:border-slate-800/80
-                            [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
-                            [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2 [&_td]:text-slate-300 [&_td]:align-top [&_td]:whitespace-normal [&_td]:break-words
-                            [&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto
+                            [&_tbody_tr:nth-child(even)]:bg-slate-900/20
+                            [&_th]:border [&_th]:border-slate-700/90 [&_th]:px-3 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-semibold [&_th]:align-top [&_th]:whitespace-normal [&_th]:break-words
+                            [&_td]:border [&_td]:border-slate-700/90 [&_td]:px-3 [&_td]:py-2.5 [&_td]:text-slate-300 [&_td]:align-top [&_td]:whitespace-normal [&_td]:break-words [&_td]:leading-6
+                            [&_th:nth-child(1)]:w-[32%] [&_td:nth-child(1)]:w-[32%]
+                            [&_th:nth-child(2)]:w-[68%] [&_td:nth-child(2)]:w-[68%]
                             [&_strong]:font-bold [&_strong]:text-white
                             ${
                               canvasOpen
-                                ? "[&_table]:w-full [&_table]:table-fixed [&_table]:text-xs [&_th]:px-2 [&_th]:py-1.5 [&_td]:px-2 [&_td]:py-1.5"
+                                ? "[&_table]:w-full [&_table]:text-[13px] [&_th]:px-2 [&_th]:py-1.5 [&_td]:px-2 [&_td]:py-1.5"
                                 : ""
                             }
                           `}>
-                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{assistantRenderContent}</ReactMarkdown>
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                              {assistantRenderContent}
+                            </ReactMarkdown>
                           </div>
                           {assistantNeedsCanvasPreview && (
                             <div className="mb-1 flex items-center justify-end">
@@ -2141,7 +3238,9 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                               </button>
                             </div>
                           )}
-                          <CitationBox citations={msg.citations} addToast={addToast} />
+                          {!hideCitationsForProUpload && (
+                            <CitationBox citations={msg.citations} addToast={addToast} />
+                          )}
                         </div>
                       )}
                     </div>
@@ -2226,7 +3325,7 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
         }`}>
           <div className="mx-auto max-w-4xl relative group pointer-events-auto">
             <div className="input-shell relative rounded-[1.35rem] border border-slate-700/70 bg-[#0b1016]/95 px-3 py-2.5 shadow-2xl backdrop-blur-2xl focus-within:border-emerald-500/50 focus-within:ring-2 focus-within:ring-emerald-500/20 transition-all duration-300">
-              {(pendingChatFiles.length > 0 || chatUploads.length > 0) && (
+              {pendingChatFiles.length > 0 && (
                 <div className="mb-2 space-y-2 rounded-xl border border-slate-700/50 bg-slate-900/40 px-3 py-2">
                   {pendingChatFiles.length > 0 && (
                     <div className="flex flex-wrap items-center gap-2 text-[11px]">
@@ -2252,36 +3351,6 @@ function ChatPanel({ onLogout, addToast, user, onOpenAdmin, theme }) {
                       >
                         {chatUploading ? "Uploading..." : "Upload"}
                       </button>
-                    </div>
-                  )}
-                  {chatUploads.length > 0 && (
-                    <div className="flex flex-wrap gap-2 text-[11px]">
-                      {chatUploads.slice(0, 8).map((item) => {
-                        const isActing = chatUploadActionId === item.id;
-                        return (
-                          <span
-                            key={item.id}
-                            className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 ${
-                              item.status === "completed"
-                                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
-                                : item.status === "failed"
-                                ? "border-rose-500/40 bg-rose-500/10 text-rose-200"
-                                : "border-slate-700 bg-slate-900/70 text-slate-300"
-                            }`}
-                            title={item.error_message || item.original_name}
-                          >
-                            <span className="max-w-[220px] truncate">{item.original_name} - {item.status}{item.indexed ? " (indexed)" : ""}</span>
-                            <button
-                              type="button"
-                              onClick={() => handleCancelUploadedFile(item)}
-                              disabled={isActing}
-                              className="rounded border border-slate-500/50 bg-slate-950/40 px-1.5 py-0.5 text-[10px] font-semibold text-slate-200 hover:border-slate-300/70 hover:text-white disabled:opacity-50"
-                            >
-                              {isActing ? "..." : "Remove"}
-                            </button>
-                          </span>
-                        );
-                      })}
                     </div>
                   )}
                 </div>
@@ -2381,28 +3450,17 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
   const [deletingBulk, setDeletingBulk] = useState(false);
   const [selectedDocIds, setSelectedDocIds] = useState([]);
   const [ingestionProgress, setIngestionProgress] = useState(0);
+  const [ingestionTracker, setIngestionTracker] = useState({
+    total: 0,
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    currentFile: "",
+    startedAt: 0,
+    elapsedSeconds: 0,
+  });
   const [showCompletionPopup, setShowCompletionPopup] = useState(false);
   const [completionResult, setCompletionResult] = useState(null);
-  const ingestionProgressTimerRef = useRef(null);
-
-  const clearIngestionProgressTimer = () => {
-    if (ingestionProgressTimerRef.current) {
-      window.clearInterval(ingestionProgressTimerRef.current);
-      ingestionProgressTimerRef.current = null;
-    }
-  };
-
-  const startIngestionProgressTimer = () => {
-    clearIngestionProgressTimer();
-    ingestionProgressTimerRef.current = window.setInterval(() => {
-      setIngestionProgress((prev) => {
-        if (prev >= 95) return prev;
-        if (prev < 60) return Math.min(95, prev + 4);
-        if (prev < 85) return Math.min(95, prev + 2);
-        return Math.min(95, prev + 1);
-      });
-    }, 600);
-  };
 
   const loadDocuments = async () => {
     try { setLoadingDocs(true); const docs = await listIngestedDocuments(); setDocuments(docs); } 
@@ -2459,7 +3517,6 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
   useEffect(() => {
     setSelectedDocIds((prev) => prev.filter((docId) => documents.some((doc) => doc.doc_id === docId)));
   }, [documents]);
-  useEffect(() => () => clearIngestionProgressTimer(), []);
 
   const appendFiles = (incoming) => {
     const selected = Array.from(incoming || []).filter((file) => file?.name?.toLowerCase().endsWith(".pdf"));
@@ -2477,41 +3534,178 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
   const runIngestion = async () => {
     if (files.length === 0 || uploading) return;
     let ingestionSucceeded = false;
+    const totalFiles = files.length;
+    const startedAt = Date.now();
+
     try {
       setUploading(true);
-      setIngestionProgress(1);
-      startIngestionProgressTimer();
-      const response = await adminIngestFiles(files, {
+      setIngestionProgress(0);
+      setIngestionTracker({
+        total: totalFiles,
+        processed: 0,
+        succeeded: 0,
+        failed: 0,
+        currentFile: "",
+        startedAt,
+        elapsedSeconds: 0,
+      });
+
+      const response = await startAdminIngestionJob(files, {
         onUploadProgress: (event) => {
           if (!event?.total) return;
-          const uploadPercent = Math.round((event.loaded / event.total) * 65);
-          setIngestionProgress((prev) => Math.max(prev, Math.min(65, uploadPercent)));
+          const uploadPercent = Math.round((event.loaded / event.total) * 100);
+          const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+          const uploadStageProgress = Math.max(1, Math.min(10, Math.round(uploadPercent / 10)));
+          setIngestionProgress((prev) => Math.max(prev, uploadStageProgress));
+          setIngestionTracker((prev) => ({
+            ...prev,
+            currentFile: `Uploading files (${uploadPercent}%)`,
+            elapsedSeconds: elapsed,
+          }));
         },
       });
-      clearIngestionProgressTimer();
+
+      const jobId = String(response?.job_id || "").trim();
+      if (!jobId) {
+        const legacyAggregate = {
+          status: String(response?.status || "success").toLowerCase(),
+          uploaded_count: Number(response?.uploaded_count || totalFiles),
+          ingested_count: Number(response?.ingested_count || 0),
+          failed_count: Number(response?.failed_count || 0),
+          ingested: Array.isArray(response?.ingested) ? response.ingested : [],
+          failed: Array.isArray(response?.failed) ? response.failed : [],
+        };
+
+        setIngestionProgress(100);
+        setIngestionTracker({
+          total: Number(legacyAggregate.uploaded_count || totalFiles),
+          processed: Number(legacyAggregate.uploaded_count || totalFiles),
+          succeeded: Number(legacyAggregate.ingested_count || 0),
+          failed: Number(legacyAggregate.failed_count || 0),
+          currentFile: "",
+          startedAt,
+          elapsedSeconds: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+        });
+
+        setResults(legacyAggregate);
+        await loadDocuments();
+        await loadAdminStatistics();
+        addToast(
+          `Ingestion finished: ${legacyAggregate.ingested_count || 0} success, ${legacyAggregate.failed_count || 0} failed`,
+          legacyAggregate.failed_count > 0 ? "error" : "success"
+        );
+        playCompletionSound();
+        notifyUser(
+          "Admin Ingestion Completed",
+          `${legacyAggregate.ingested_count || 0} indexed, ${legacyAggregate.failed_count || 0} failed.`
+        );
+        if ((legacyAggregate.failed_count || 0) === 0) setFiles([]);
+        setCompletionResult(legacyAggregate);
+        setShowCompletionPopup(true);
+        ingestionSucceeded = true;
+        return;
+      }
+
+      let aggregate = null;
+      let pollFailures = 0;
+      while (true) {
+        let job = null;
+        try {
+          job = await getAdminIngestionJob(jobId);
+          pollFailures = 0;
+        } catch (pollError) {
+          pollFailures += 1;
+          if (pollFailures >= 5) {
+            throw pollError;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 1200));
+          continue;
+        }
+        const uploadedCount = Number(job?.uploaded_count || totalFiles);
+        const processedCount = Number(job?.processed_count || 0);
+        const ingestedCount = Number(job?.ingested_count || 0);
+        const failedCount = Number(job?.failed_count || 0);
+        const elapsed = Math.max(1, Math.round(job?.elapsed_seconds || (Date.now() - startedAt) / 1000));
+        const status = String(job?.status || "").toLowerCase();
+        const isFinal = status === "success" || status === "partial" || status === "failed";
+        const processedRatio = uploadedCount > 0
+          ? Math.min(processedCount, uploadedCount) / uploadedCount
+          : 0;
+        const processingProgress = Math.round((processedRatio * 90) + 10);
+        const nextProgress = isFinal ? 100 : Math.max(10, Math.min(99, processingProgress));
+        setIngestionProgress((prev) => Math.max(prev, nextProgress));
+        setIngestionTracker({
+          total: uploadedCount,
+          processed: processedCount,
+          succeeded: ingestedCount,
+          failed: failedCount,
+          currentFile: job?.current_file || "",
+          startedAt,
+          elapsedSeconds: elapsed,
+        });
+
+        if (status === "success" || status === "partial" || status === "failed") {
+          aggregate = {
+            status,
+            uploaded_count: uploadedCount,
+            ingested_count: ingestedCount,
+            failed_count: failedCount,
+            ingested: Array.isArray(job?.ingested) ? job.ingested : [],
+            failed: Array.isArray(job?.failed) ? job.failed : [],
+          };
+          break;
+        }
+
+        await new Promise((resolve) => window.setTimeout(resolve, 800));
+      }
+
       setIngestionProgress(100);
-      setResults(response);
+      setIngestionTracker((prev) => ({
+        ...prev,
+        total: Number(aggregate?.uploaded_count || totalFiles),
+        processed: Number(aggregate?.uploaded_count || totalFiles),
+        succeeded: Number(aggregate?.ingested_count || 0),
+        failed: Number(aggregate?.failed_count || 0),
+        currentFile: "",
+      }));
+
+      setResults(aggregate);
       await loadDocuments();
       await loadAdminStatistics();
-      addToast(`Ingestion finished: ${response.ingested_count || 0} success, ${response.failed_count || 0} failed`, "success");
+      addToast(
+        `Ingestion finished: ${aggregate.ingested_count || 0} success, ${aggregate.failed_count || 0} failed`,
+        aggregate.status === "failed" ? "error" : "success"
+      );
       playCompletionSound();
       notifyUser(
         "Admin Ingestion Completed",
-        `${response.ingested_count || 0} indexed, ${response.failed_count || 0} failed.`
+        `${aggregate.ingested_count || 0} indexed, ${aggregate.failed_count || 0} failed.`
       );
-      if ((response.failed_count || 0) === 0) setFiles([]);
-      setCompletionResult(response);
+      if ((aggregate.failed_count || 0) === 0) setFiles([]);
+      setCompletionResult(aggregate);
       setShowCompletionPopup(true);
       ingestionSucceeded = true;
     } catch (error) {
-      clearIngestionProgressTimer();
+      const status = Number(error?.status || 0);
       addToast(getErrorMessage(error, "Ingestion failed"), "error");
+      if (
+        status === 401 ||
+        status === 403 ||
+        /authorization token required|invalid token|expired|insufficient permissions|unauthorized/i.test(
+          getErrorMessage(error, "")
+        )
+      ) {
+        addToast("Admin session expired or unauthorized. Sign in again and retry.", "error");
+      }
       playCompletionSound();
       notifyUser("Admin Ingestion Failed", getErrorMessage(error, "Ingestion failed"));
     } 
     finally {
       setUploading(false);
-      if (!ingestionSucceeded) setIngestionProgress(0);
+      if (!ingestionSucceeded) {
+        setIngestionProgress(0);
+      }
+      setIngestionTracker((prev) => ({ ...prev, currentFile: "" }));
     }
   };
 
@@ -2613,6 +3807,13 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
       setDeletingBulk(false);
     }
   };
+
+  const processedDocs = ingestionTracker.processed;
+  const totalDocs = ingestionTracker.total;
+  const elapsedSeconds = ingestionTracker.elapsedSeconds;
+  const averageSecondsPerDoc = processedDocs > 0 ? elapsedSeconds / processedDocs : 0;
+  const remainingDocs = Math.max(0, totalDocs - processedDocs);
+  const etaSeconds = remainingDocs > 0 ? Math.round(averageSecondsPerDoc * remainingDocs) : 0;
 
   return (
     <div className="min-h-screen bg-[#05090f] text-slate-100 font-sans selection:bg-cyan-500/30 relative">
@@ -2851,7 +4052,14 @@ function AdminIngestionPanel({ onBackToChat, onLogout, addToast }) {
                   />
                 </div>
                 <p className="mt-2 text-xs text-slate-300">
-                  {ingestionProgress < 100 ? "Uploading and indexing documents..." : "Completed"}
+                  {processedDocs < totalDocs
+                    ? `Indexed ${processedDocs}/${totalDocs} documents${ingestionTracker.currentFile ? ` | Current: ${ingestionTracker.currentFile}` : ""}`
+                    : "Completed"}
+                </p>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  Elapsed: {formatSeconds(elapsedSeconds)}
+                  {processedDocs > 0 ? ` | Avg/doc: ${formatSeconds(averageSecondsPerDoc)}` : ""}
+                  {remainingDocs > 0 && processedDocs > 0 ? ` | ETA: ${formatSeconds(etaSeconds)}` : ""}
                 </p>
               </div>
             )}
@@ -3243,5 +4451,7 @@ export default function App() {
     </>
   );
 }
+
+
 
 

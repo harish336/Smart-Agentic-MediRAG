@@ -97,11 +97,11 @@ Extract all TOC entries from this text:
 Return EXACTLY:
 
 [
-{
+{{
     "title": "string",
     "page_label": "string or null",
     "level": "chapter|section|subsection|unknown"
-}
+}}
 ]
 """
 

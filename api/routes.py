@@ -12,9 +12,11 @@ import time
 import uuid
 import threading
 import zipfile
+import mimetypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple, List
 import xml.etree.ElementTree as ET
 
 from flask import g, jsonify, request, send_file
@@ -22,6 +24,7 @@ from werkzeug.utils import secure_filename
 import fitz
 
 from answering.answering_agent import AnsweringAgent
+from answering.chat_orchestrator import ChatOrchestrator
 from answering.uploaded_document_agent import UploadedDocumentAgent
 from api.auth.middleware import require_auth, require_role
 from memory.memory_wrapper import MemoryWrappedAnsweringAgent
@@ -77,6 +80,10 @@ ALLOWED_CHAT_UPLOAD_EXTENSIONS = {
     ".gif",
 }
 logger = get_component_logger("api.routes", component="ingestion")
+DEFAULT_ADMIN_INGEST_MAX_WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+ADMIN_INGEST_JOB_TTL_SECONDS = 12 * 60 * 60
+_admin_ingest_jobs: dict[str, dict] = {}
+_admin_ingest_jobs_lock = threading.Lock()
 
 
 def _structured_citations(citations: list[dict]) -> list[dict]:
@@ -127,14 +134,19 @@ def _preferences_context_block(user_id: str, thread_id: str) -> str:
     thread_pref = get_thread_preferences(thread_id)
     summary_row = get_thread_summary(thread_id) or {}
     summary = (summary_row.get("summary") or "").strip()
-    effective_pref = dict(global_pref)
-    effective_pref.update(thread_pref)
 
     lines = []
-    if effective_pref:
+    if thread_pref:
         lines.append("### User Preferences")
-        for key in sorted(effective_pref.keys()):
-            lines.append(f"- {key}: {effective_pref[key]}")
+        for key in sorted(thread_pref.keys()):
+            lines.append(f"- {key}: {thread_pref[key]}")
+
+    if global_pref:
+        if lines:
+            lines.append("")
+        lines.append("### User Global Preferences")
+        for key in sorted(global_pref.keys()):
+            lines.append(f"- {key}: {global_pref[key]}")
 
     if summary:
         lines.append("")
@@ -183,23 +195,52 @@ def _run_ingestion(
     pdf_path: str,
     owner_user_id: str | None = None,
     scope: str = "global",
+    ingest_id: str | None = None,
 ) -> dict:
     start_time = time.time()
+    run_id = ingest_id or uuid.uuid4().hex[:8]
+    pdf_name = Path(pdf_path).name
+    logger.info(
+        "ingestion_start ingest_id=%s scope=%s owner_user_id=%s file=%s",
+        run_id,
+        scope,
+        owner_user_id,
+        pdf_name,
+    )
 
     from pipelines.full_ingestion_pipeline import FullIngestionPipeline
 
-    pipeline = FullIngestionPipeline(
-        pdf_path,
-        owner_user_id=owner_user_id,
-        scope=scope,
-    )
-    pipeline.run()
-
-    return {
-        "pdf_path": pdf_path,
-        "document_id": getattr(getattr(pipeline, "vector_orch", None), "document_id", None),
-        "ingestion_time_seconds": round(time.time() - start_time, 4),
-    }
+    try:
+        pipeline = FullIngestionPipeline(
+            pdf_path,
+            owner_user_id=owner_user_id,
+            scope=scope,
+        )
+        pipeline.run()
+        payload = {
+            "pdf_path": pdf_path,
+            "document_id": getattr(getattr(pipeline, "vector_orch", None), "document_id", None),
+            "ingestion_time_seconds": round(time.time() - start_time, 4),
+            "ingest_id": run_id,
+        }
+        logger.info(
+            "ingestion_done ingest_id=%s scope=%s file=%s doc_id=%s time_s=%s",
+            run_id,
+            scope,
+            pdf_name,
+            payload.get("document_id"),
+            payload.get("ingestion_time_seconds"),
+        )
+        return payload
+    except Exception:
+        logger.exception(
+            "ingestion_failed ingest_id=%s scope=%s owner_user_id=%s file=%s",
+            run_id,
+            scope,
+            owner_user_id,
+            pdf_name,
+        )
+        raise
 
 
 def _is_allowed_filename(filename: str) -> bool:
@@ -217,6 +258,221 @@ def _to_bool(value, default: bool = False) -> bool:
         return default
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "on", "y"}
+
+
+def _admin_ingest_max_workers(total_files: int) -> int:
+    configured = os.getenv("ADMIN_INGEST_MAX_WORKERS", str(DEFAULT_ADMIN_INGEST_MAX_WORKERS))
+    try:
+        requested = int(configured)
+    except (TypeError, ValueError):
+        requested = DEFAULT_ADMIN_INGEST_MAX_WORKERS
+    return max(1, min(total_files, requested))
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _cleanup_admin_ingest_jobs(now_ts: float | None = None) -> None:
+    cutoff = (now_ts or time.time()) - ADMIN_INGEST_JOB_TTL_SECONDS
+    stale = []
+    for job_id, job in _admin_ingest_jobs.items():
+        finished_at_ts = job.get("finished_at_ts")
+        if finished_at_ts and finished_at_ts < cutoff:
+            stale.append(job_id)
+    for job_id in stale:
+        _admin_ingest_jobs.pop(job_id, None)
+
+
+def _admin_ingest_snapshot(job: dict) -> dict:
+    total = int(job.get("total", 0))
+    processed = int(job.get("processed", 0))
+    progress_percent = 0 if total <= 0 else int(round((processed / total) * 100))
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "uploaded_count": total,
+        "processed_count": processed,
+        "ingested_count": int(job.get("succeeded", 0)),
+        "failed_count": int(job.get("failed_count", 0)),
+        "current_file": job.get("current_file", ""),
+        "started_at": job.get("started_at"),
+        "created_at": job.get("created_at"),
+        "finished_at": job.get("finished_at"),
+        "elapsed_seconds": int(job.get("elapsed_seconds", 0)),
+        "progress_percent": max(0, min(100, progress_percent)),
+        "ingested": list(job.get("ingested", [])),
+        "failed": list(job.get("failed", [])),
+    }
+
+
+def _admin_ingest_finalize(job: dict) -> None:
+    succeeded = int(job.get("succeeded", 0))
+    failed_count = int(job.get("failed_count", 0))
+    if succeeded > 0 and failed_count == 0:
+        status = "success"
+    elif succeeded > 0:
+        status = "partial"
+    else:
+        status = "failed"
+    job["status"] = status
+    job["current_file"] = ""
+    job["finished_at"] = _utc_now_iso()
+    job["finished_at_ts"] = time.time()
+
+
+def _start_admin_ingest_job(
+    job_id: str,
+    saved_files: list[tuple[str, str]],
+    *,
+    admin_id: str | None = None,
+) -> None:
+    start_ts = time.time()
+    with _admin_ingest_jobs_lock:
+        job = _admin_ingest_jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["started_at"] = _utc_now_iso()
+        if not saved_files and int(job.get("processed", 0)) >= int(job.get("total", 0)):
+            job["elapsed_seconds"] = max(1, int(round(time.time() - start_ts)))
+            _admin_ingest_finalize(job)
+            return
+
+    workers = _admin_ingest_max_workers(len(saved_files)) if saved_files else 1
+    if saved_files:
+        logger.info(
+            "admin_ingest_job running job_id=%s user_id=%s files=%s workers=%s",
+            job_id,
+            admin_id,
+            len(saved_files),
+            workers,
+        )
+
+    def _ingest_one(item: tuple[str, str]) -> tuple[str, str, dict]:
+        safe_name_local, target_path_local = item
+        ingest_id = uuid.uuid4().hex[:8]
+        result_local = _run_ingestion(target_path_local, ingest_id=ingest_id)
+        return safe_name_local, target_path_local, result_local
+
+    if saved_files:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_file = {executor.submit(_ingest_one, item): item for item in saved_files}
+            for future in as_completed(future_to_file):
+                safe_name, target_path = future_to_file[future]
+                elapsed = max(1, int(round(time.time() - start_ts)))
+                try:
+                    done_name, done_path, result = future.result()
+                    logger.info(
+                        "admin_ingest_job success job_id=%s user_id=%s filename=%s doc_id=%s path=%s",
+                        job_id,
+                        admin_id,
+                        done_name,
+                        result.get("document_id"),
+                        done_path,
+                    )
+                    with _admin_ingest_jobs_lock:
+                        job = _admin_ingest_jobs.get(job_id)
+                        if not job:
+                            continue
+                        job["processed"] = int(job.get("processed", 0)) + 1
+                        job["succeeded"] = int(job.get("succeeded", 0)) + 1
+                        job["current_file"] = done_name
+                        job["elapsed_seconds"] = elapsed
+                        job.setdefault("ingested", []).append({"filename": done_name, **result})
+                except Exception as exc:
+                    logger.exception(
+                        "admin_ingest_job failed job_id=%s user_id=%s filename=%s error=%s",
+                        job_id,
+                        admin_id,
+                        safe_name,
+                        str(exc),
+                    )
+                    with _admin_ingest_jobs_lock:
+                        job = _admin_ingest_jobs.get(job_id)
+                        if not job:
+                            continue
+                        job["processed"] = int(job.get("processed", 0)) + 1
+                        job["failed_count"] = int(job.get("failed_count", 0)) + 1
+                        job["current_file"] = safe_name
+                        job["elapsed_seconds"] = elapsed
+                        job.setdefault("failed", []).append({"filename": safe_name, "error": str(exc)})
+
+    with _admin_ingest_jobs_lock:
+        job = _admin_ingest_jobs.get(job_id)
+        if not job:
+            return
+        job["elapsed_seconds"] = max(1, int(round(time.time() - start_ts)))
+        _admin_ingest_finalize(job)
+        logger.info(
+            "admin_ingest_job summary job_id=%s user_id=%s uploaded=%s processed=%s ingested=%s failed=%s status=%s",
+            job_id,
+            admin_id,
+            job.get("total", 0),
+            job.get("processed", 0),
+            job.get("succeeded", 0),
+            job.get("failed_count", 0),
+            job.get("status"),
+        )
+
+
+def _normalize_thread_messages(payload) -> list[dict]:
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise ValueError("thread_messages must be an array")
+
+    normalized = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"}:
+            continue
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+
+    return normalized[-8:]
+
+
+def _normalize_user_message_meta(payload) -> dict:
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ValueError("user_message_meta must be an object")
+
+    meta: dict = {}
+
+    upload_ids = payload.get("upload_ids")
+    if isinstance(upload_ids, list):
+        cleaned_ids = [str(item or "").strip() for item in upload_ids if str(item or "").strip()]
+        if cleaned_ids:
+            meta["upload_ids"] = cleaned_ids
+
+    attached_files = payload.get("attached_files")
+    if isinstance(attached_files, list):
+        cleaned_files = []
+        for item in attached_files:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("original_name") or "").strip()
+            file_type = str(item.get("type") or item.get("media_type") or "").strip()
+            upload_id = str(item.get("uploadId") or item.get("upload_id") or item.get("id") or "").strip()
+            if not name:
+                continue
+            cleaned_files.append(
+                {
+                    "name": name,
+                    "type": file_type,
+                    "upload_id": upload_id,
+                }
+            )
+        if cleaned_files:
+            meta["attached_files"] = cleaned_files
+
+    return meta
 
 
 def _serialize_upload_row(row: dict | None) -> dict | None:
@@ -297,6 +553,95 @@ def _build_upload_context(user_id: str, upload_ids: list[str], max_chars: int = 
         consumed += len(snippet)
 
     return "\n\n".join(context_parts).strip()
+
+
+def _collect_upload_bundle(
+    user_id: str,
+    upload_ids: list[str],
+    max_chars: int = 12000,
+    include_indexed_text: bool = False,
+) -> Tuple[str, List[str]]:
+    """
+    Returns:
+    - upload_context from completed uploads (non-indexed by default; optionally indexed too)
+    - selected indexed doc_ids for retrieval scoping
+    """
+    if not upload_ids:
+        return "", []
+
+    context_parts = []
+    selected_doc_ids: List[str] = []
+    consumed = 0
+
+    for upload_id in upload_ids:
+        row = get_user_upload(upload_id, user_id)
+        if not row:
+            continue
+        if row.get("status") != "completed":
+            continue
+
+        if row.get("indexed"):
+            doc_id = str(row.get("doc_id") or "").strip()
+            if doc_id:
+                selected_doc_ids.append(doc_id)
+            if not include_indexed_text:
+                continue
+
+        text = (row.get("extracted_text") or "").strip()
+        if not text:
+            continue
+
+        remaining = max_chars - consumed
+        if remaining <= 0:
+            break
+
+        snippet = text[:remaining]
+        context_parts.append(f"### Uploaded File: {row.get('original_name')}\n{snippet}")
+        consumed += len(snippet)
+
+    deduped_doc_ids = list(dict.fromkeys(selected_doc_ids))
+    return "\n\n".join(context_parts).strip(), deduped_doc_ids
+
+
+def _build_regeneration_context(thread_id: str, rewrite_from_message_id: str) -> str:
+    target_thread_id = (thread_id or "").strip()
+    target_message_id = (rewrite_from_message_id or "").strip()
+    if not target_thread_id or not target_message_id:
+        return ""
+
+    try:
+        rows = get_thread_messages(target_thread_id)
+        if not rows:
+            return ""
+
+        for idx, row in enumerate(rows):
+            if str(row.get("id") or "").strip() != target_message_id:
+                continue
+            user_question = (row.get("content") or "").strip()
+            prior_answer = ""
+            if idx + 1 < len(rows):
+                next_row = rows[idx + 1]
+                if str(next_row.get("role") or "").strip().lower() == "assistant":
+                    prior_answer = (next_row.get("content") or "").strip()
+            if not user_question and not prior_answer:
+                return ""
+
+            sections = ["### Regeneration Guidance"]
+            if user_question:
+                sections.append("Original user question:")
+                sections.append(user_question)
+            if prior_answer:
+                sections.append("Previous assistant answer to improve:")
+                sections.append(prior_answer)
+            sections.append(
+                "Generate a better answer for the same user request while preserving factual grounding."
+            )
+            return "\n\n".join(sections).strip()
+    except Exception:
+        logger.exception("Failed building regeneration context | thread_id=%s", target_thread_id)
+        return ""
+
+    return ""
 
 
 def _run_user_upload_job(upload_id: str, user_id: str) -> None:
@@ -420,6 +765,7 @@ def register_routes(app):
     base_agent = AnsweringAgent()
     agent = MemoryWrappedAnsweringAgent(base_agent)
     uploaded_doc_agent = UploadedDocumentAgent()
+    chat_orchestrator = ChatOrchestrator(agent, uploaded_doc_agent)
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -453,6 +799,7 @@ def register_routes(app):
     def admin_ingest_upload():
         admin_user = (getattr(g, "user", None) or {})
         admin_id = admin_user.get("user_id")
+        async_mode = _to_bool(request.args.get("async"), default=False)
         files = request.files.getlist("files")
         if not files and request.files.get("file"):
             files = [request.files.get("file")]
@@ -462,7 +809,7 @@ def register_routes(app):
 
         ADMIN_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-        ingested = []
+        saved_files = []
         failed = []
 
         for uploaded in files:
@@ -481,18 +828,7 @@ def register_routes(app):
 
             try:
                 uploaded.save(str(target_path))
-                result = _run_ingestion(str(target_path))
-                logger.info(
-                    "admin_ingest_upload success user_id=%s filename=%s doc_id=%s path=%s",
-                    admin_id,
-                    safe_name,
-                    result.get("document_id"),
-                    str(target_path),
-                )
-                ingested.append({
-                    "filename": safe_name,
-                    **result,
-                })
+                saved_files.append((safe_name, str(target_path)))
             except Exception as exc:
                 logger.exception(
                     "admin_ingest_upload failed user_id=%s filename=%s error=%s",
@@ -501,6 +837,94 @@ def register_routes(app):
                     str(exc),
                 )
                 failed.append({"filename": safe_name, "error": str(exc)})
+
+        if async_mode:
+            job_id = uuid.uuid4().hex[:12]
+            with _admin_ingest_jobs_lock:
+                _cleanup_admin_ingest_jobs()
+                _admin_ingest_jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "queued",
+                    "total": len(files),
+                    "processed": len(failed),
+                    "succeeded": 0,
+                    "failed_count": len(failed),
+                    "current_file": "",
+                    "created_at": _utc_now_iso(),
+                    "started_at": None,
+                    "finished_at": None,
+                    "finished_at_ts": None,
+                    "elapsed_seconds": 0,
+                    "ingested": [],
+                    "failed": list(failed),
+                }
+                snapshot = _admin_ingest_snapshot(_admin_ingest_jobs[job_id])
+
+            if saved_files:
+                threading.Thread(
+                    target=_start_admin_ingest_job,
+                    args=(job_id, saved_files),
+                    kwargs={"admin_id": admin_id},
+                    daemon=True,
+                ).start()
+            else:
+                with _admin_ingest_jobs_lock:
+                    job = _admin_ingest_jobs.get(job_id)
+                    if job:
+                        job["status"] = "running"
+                        job["started_at"] = _utc_now_iso()
+                        job["elapsed_seconds"] = 1
+                        _admin_ingest_finalize(job)
+                        snapshot = _admin_ingest_snapshot(job)
+
+            return jsonify(
+                {
+                    "status": "accepted",
+                    "job_id": job_id,
+                    **snapshot,
+                }
+            ), 202
+
+        ingested = []
+        if saved_files:
+            workers = _admin_ingest_max_workers(len(saved_files))
+            logger.info(
+                "admin_ingest_upload running parallel ingestion user_id=%s files=%s workers=%s",
+                admin_id,
+                len(saved_files),
+                workers,
+            )
+
+            def _ingest_one(item: tuple[str, str]) -> tuple[str, dict]:
+                safe_name_local, target_path_local = item
+                ingest_id = uuid.uuid4().hex[:8]
+                result_local = _run_ingestion(target_path_local, ingest_id=ingest_id)
+                return safe_name_local, result_local
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_file = {
+                    executor.submit(_ingest_one, item): item for item in saved_files
+                }
+                for future in as_completed(future_to_file):
+                    safe_name, target_path = future_to_file[future]
+                    try:
+                        _, result = future.result()
+                        logger.info(
+                            "admin_ingest_upload success user_id=%s filename=%s doc_id=%s path=%s",
+                            admin_id,
+                            safe_name,
+                            result.get("document_id"),
+                            target_path,
+                        )
+                        ingested.append({"filename": safe_name, **result})
+                    except Exception as exc:
+                        logger.exception(
+                            "admin_ingest_upload failed user_id=%s filename=%s error=%s",
+                            admin_id,
+                            safe_name,
+                            str(exc),
+                        )
+                        failed.append({"filename": safe_name, "error": str(exc)})
 
         status = "success" if ingested and not failed else "partial" if ingested else "failed"
         http_code = 200 if status == "success" else 207 if status == "partial" else 400
@@ -523,6 +947,20 @@ def register_routes(app):
                 "failed": failed,
             }
         ), http_code
+
+    @app.route("/admin/ingest/jobs/<job_id>", methods=["GET"])
+    @require_role("admin")
+    def admin_ingest_job_status(job_id: str):
+        resolved = (job_id or "").strip()
+        if not resolved:
+            return jsonify({"error": "job_id required"}), 400
+        with _admin_ingest_jobs_lock:
+            _cleanup_admin_ingest_jobs()
+            job = _admin_ingest_jobs.get(resolved)
+            if not job:
+                return jsonify({"error": "job not found"}), 404
+            snapshot = _admin_ingest_snapshot(job)
+        return jsonify(snapshot)
 
     @app.route("/admin/documents", methods=["GET"])
     @require_role("admin")
@@ -906,6 +1344,28 @@ def register_routes(app):
             return jsonify({"error": "upload not found"}), 404
         return jsonify({"upload": _serialize_upload_row(row)})
 
+    @app.route("/chat/uploads/<upload_id>/file", methods=["GET"])
+    @require_auth
+    def chat_uploads_get_file(upload_id: str):
+        user_id = g.user["user_id"]
+        row = get_user_upload(upload_id, user_id)
+        if not row:
+            return jsonify({"error": "upload not found"}), 404
+
+        file_path = Path(str(row.get("file_path") or "").strip())
+        if not file_path.exists() or not file_path.is_file():
+            return jsonify({"error": "uploaded file is unavailable"}), 404
+
+        download_name = str(row.get("original_name") or file_path.name or "upload").strip()
+        guessed_mime, _ = mimetypes.guess_type(download_name)
+        return send_file(
+            str(file_path),
+            as_attachment=False,
+            mimetype=guessed_mime or "application/octet-stream",
+            download_name=download_name,
+            conditional=True,
+        )
+
     @app.route("/chat/uploads/<upload_id>", methods=["DELETE"])
     @require_auth
     def chat_uploads_delete(upload_id: str):
@@ -966,16 +1426,29 @@ def register_routes(app):
         query = (data.get("query") or "").strip()
         requested_thread_id = (data.get("thread_id") or "").strip()
         upload_ids_raw = data.get("upload_ids") or []
+        thread_messages_raw = data.get("thread_messages")
+        user_message_meta_raw = data.get("user_message_meta")
         rewrite_from_message_id = (data.get("rewrite_from_message_id") or "").strip()
         agent_hint = (data.get("agent_hint") or "").strip().lower()
+        query_mode = (data.get("query_mode") or "fast").strip().lower()
         global_pref_update = data.get("user_global_preference")
         thread_pref_update = data.get("thread_preference")
         if not query:
             return jsonify({"error": "query required"}), 400
         if not isinstance(upload_ids_raw, list):
             return jsonify({"error": "upload_ids must be an array"}), 400
+        try:
+            thread_messages = _normalize_thread_messages(thread_messages_raw)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        try:
+            user_message_meta = _normalize_user_message_meta(user_message_meta_raw)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         if agent_hint and agent_hint not in {"memory_answering_agent", "uploaded_document_agent"}:
             return jsonify({"error": "agent_hint must be memory_answering_agent or uploaded_document_agent"}), 400
+        if query_mode not in {"fast", "pro"}:
+            return jsonify({"error": "query_mode must be fast or pro"}), 400
 
         user_id = g.user["user_id"]
         user_role = g.user["role"]
@@ -1007,95 +1480,68 @@ def register_routes(app):
                 preferences=thread_pref_update,
             )
 
+        regeneration_context = ""
         if rewrite_from_message_id:
+            regeneration_context = _build_regeneration_context(
+                thread_id=thread_id,
+                rewrite_from_message_id=rewrite_from_message_id,
+            )
             deleted_count = delete_messages_from_message_id(
                 thread_id=thread_id,
                 message_id=rewrite_from_message_id,
             )
             if deleted_count == 0:
-                return jsonify({"error": "rewrite_from_message_id not found in this thread"}), 400
+                logger.warning(
+                    "rewrite_from_message_id not found; continuing as normal ask | thread_id=%s message_id=%s user_id=%s",
+                    thread_id,
+                    rewrite_from_message_id,
+                    user_id,
+                )
+                regeneration_context = ""
 
         context_prefix_base = _preferences_context_block(user_id=user_id, thread_id=thread_id)
-        upload_context = _build_upload_context(user_id=user_id, upload_ids=upload_ids)
-        context_prefix = context_prefix_base
-        if upload_context:
-            context_prefix = "\n\n".join(
-                part for part in [context_prefix, "### Uploaded Context\n" + upload_context] if part
+        if regeneration_context:
+            context_prefix_base = "\n\n".join(
+                [part for part in [context_prefix_base, regeneration_context] if part]
             )
+        upload_context_chars = 24000 if query_mode == "pro" else 12000
+        upload_context, selected_doc_ids = _collect_upload_bundle(
+            user_id=user_id,
+            upload_ids=upload_ids,
+            max_chars=upload_context_chars,
+            include_indexed_text=(agent_hint == "uploaded_document_agent"),
+        )
         retrieval_filters = {"owner_user_id": user_id} if user_role != "admin" else None
 
-        agent_used = "memory_answering_agent"
         try:
-            # If user selected non-indexed uploaded files, answer directly from those contents first.
-            # This avoids retrieval misses for ad-hoc uploads that are not in the vector index.
-            if agent_hint == "memory_answering_agent":
-                agent_used = "memory_answering_agent"
-                result = agent.answer(
-                    user_id=user_id,
-                    query=query,
-                    thread_id=thread_id,
-                    context_prefix=context_prefix,
-                    retrieval_filters=retrieval_filters,
-                )
-            elif agent_hint == "uploaded_document_agent":
-                if upload_context:
-                    agent_used = "uploaded_document_agent"
-                    result = uploaded_doc_agent.answer(
-                        query=query,
-                        uploaded_context=upload_context,
-                        context_prefix=context_prefix_base,
-                    )
-                    if (result.get("response") or "").strip().lower() == "dont have an answer":
-                        agent_used = "memory_answering_agent_fallback"
-                        result = agent.answer(
-                            user_id=user_id,
-                            query=query,
-                            thread_id=thread_id,
-                            context_prefix=context_prefix,
-                            retrieval_filters=retrieval_filters,
-                        )
-                else:
-                    agent_used = "memory_answering_agent_fallback"
-                    result = agent.answer(
-                        user_id=user_id,
-                        query=query,
-                        thread_id=thread_id,
-                        context_prefix=context_prefix,
-                        retrieval_filters=retrieval_filters,
-                    )
-            elif upload_context:
-                agent_used = "uploaded_document_agent"
-                result = uploaded_doc_agent.answer(
-                    query=query,
-                    uploaded_context=upload_context,
-                    context_prefix=context_prefix_base,
-                )
-                if (result.get("response") or "").strip().lower() == "dont have an answer":
-                    agent_used = "memory_answering_agent_fallback"
-                    result = agent.answer(
-                        user_id=user_id,
-                        query=query,
-                        thread_id=thread_id,
-                        context_prefix=context_prefix,
-                        retrieval_filters=retrieval_filters,
-                    )
-            else:
-                agent_used = "memory_answering_agent"
-                result = agent.answer(
-                    user_id=user_id,
-                    query=query,
-                    thread_id=thread_id,
-                    context_prefix=context_prefix,
-                    retrieval_filters=retrieval_filters,
-                )
+            result, agent_used = chat_orchestrator.answer(
+                user_id=user_id,
+                user_role=user_role,
+                query=query,
+                thread_id=thread_id,
+                query_mode=query_mode,
+                context_prefix_base=context_prefix_base,
+                upload_context=upload_context,
+                selected_doc_ids=selected_doc_ids,
+                agent_hint=agent_hint,
+                retrieval_filters=retrieval_filters,
+                thread_messages=thread_messages,
+            )
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
 
         assistant_response = result.get("response", "") or ""
         follow_up = result.get("follow_up", "") or ""
         citations = _structured_citations(result.get("citations", []) or [])
+        if query_mode == "pro" and upload_ids:
+            citations = []
 
-        save_message(thread_id=thread_id, role="user", content=query)
+        save_message(
+            thread_id=thread_id,
+            role="user",
+            content=query,
+            metadata=user_message_meta,
+        )
         save_message(
             thread_id=thread_id,
             role="assistant",
@@ -1124,6 +1570,7 @@ def register_routes(app):
                 "follow_up": follow_up,
                 "citations": citations,
                 "agent_used": agent_used,
+                "query_mode": query_mode,
                 "chat_summary": summary_row.get("summary", ""),
                 "effective_preferences": effective_pref,
             }
@@ -1240,11 +1687,10 @@ def register_routes(app):
         upsert_thread_summary(user_id=user_id, thread_id=thread_id, summary=content)
 
         try:
-            agent.memory.append_stm(
+            agent.memory.upsert_latest_assistant_stm(
                 user_id=user_id,
                 thread_id=thread_id,
-                role="assistant",
-                content=content,
+                content=content
             )
             agent.memory.store_ltm(
                 user_id=user_id,

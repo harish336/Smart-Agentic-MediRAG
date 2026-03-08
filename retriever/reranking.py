@@ -35,8 +35,19 @@ def get_cross_encoder(model_name: str, device: str) -> CrossEncoder:
             _cross_encoder_instance = CrossEncoder(
                 model_name,
                 device=device,
-                max_length=1024
             )
+
+            # Keep max sequence length within model limits (XLM-R family can fail if oversized).
+            model_max = getattr(_cross_encoder_instance.model.config, "max_position_embeddings", None)
+            tokenizer_max = getattr(_cross_encoder_instance.tokenizer, "model_max_length", None)
+            candidates = []
+            if isinstance(model_max, int) and model_max > 2:
+                candidates.append(model_max - 2)
+            if isinstance(tokenizer_max, int) and 0 < tokenizer_max < 100000:
+                candidates.append(tokenizer_max)
+            if candidates:
+                _cross_encoder_instance.max_length = min(candidates)
+                logger.info("CrossEncoder max_length set to %d", _cross_encoder_instance.max_length)
 
             # Move to FP16 if GPU available
             if device == "cuda":

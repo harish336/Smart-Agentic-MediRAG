@@ -4,6 +4,7 @@ SmartChunk-RAG - Answering Agent
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -93,6 +94,10 @@ class AnsweringAgent:
         query: str,
         retrieval_query: Optional[str] = None,
         retrieval_filters: Optional[Dict] = None,
+        thread_messages: Optional[List[Dict]] = None,
+        retrieval_options: Optional[Dict] = None,
+        supplemental_context: str = "",
+        conversation_window: str = "",
     ) -> Dict:
         if not query or not query.strip():
             return {"response": "", "citations": [], "follow_up": ""}
@@ -131,49 +136,85 @@ class AnsweringAgent:
                 self.citation_manager = get_citation_manager()
 
             search_query = retrieval_query or query
-            sub_questions = self._decompose_compound_query(search_query)
+            if intent == "book":
+                search_query = self._build_thread_aware_book_query(
+                    query=search_query,
+                    thread_messages=thread_messages,
+                )
+                # Pro/book path: one focused retrieval query for lower latency.
+                sub_questions = [search_query]
+            else:
+                sub_questions = self._decompose_compound_query(search_query)
+                max_sub = int((retrieval_options or {}).get("max_sub_queries", 3) or 3)
+                if max_sub > 0:
+                    sub_questions = sub_questions[:max_sub]
             retrieval_results, coverage = self._retrieve_compound(
                 queries=sub_questions,
                 intent=intent,
                 retrieval_filters=retrieval_filters,
+                retrieval_options=retrieval_options,
             )
+            supplemental_chunks = self._build_supplemental_chunks(supplemental_context)
 
-            if not retrieval_results:
+            if not retrieval_results and not supplemental_chunks:
                 return {
                     "response": "dont have an answer",
                     "citations": [],
                     "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
-            max_rerank_score = max(
-                float(r.get("rerank_score", 0.0) or 0.0) for r in retrieval_results
-            )
-            rerank_threshold = (
-                MEDICAL_RERANK_THRESHOLD if intent == "medical" else BOOK_RERANK_THRESHOLD
-            )
-            logger.info(
-                "Rerank gate check | intent=%s max_rerank_score=%.4f threshold=%.4f",
-                intent,
-                max_rerank_score,
-                rerank_threshold,
-            )
-            if max_rerank_score < rerank_threshold:
-                return {
-                    "response": "dont have an answer",
-                    "citations": [],
-                    "follow_up": self._build_follow_up(query, intent, coverage),
-                }
+            if retrieval_results:
+                max_rerank_score = max(
+                    float(r.get("rerank_score", 0.0) or 0.0) for r in retrieval_results
+                )
+                rerank_threshold = (
+                    MEDICAL_RERANK_THRESHOLD if intent == "medical" else BOOK_RERANK_THRESHOLD
+                )
+                logger.info(
+                    "Rerank gate check | intent=%s max_rerank_score=%.4f threshold=%.4f supplemental_chunks=%d",
+                    intent,
+                    max_rerank_score,
+                    rerank_threshold,
+                    len(supplemental_chunks),
+                )
+                if max_rerank_score < rerank_threshold and not supplemental_chunks:
+                    return {
+                        "response": "dont have an answer",
+                        "citations": [],
+                        "follow_up": self._build_follow_up(query, intent, coverage),
+                    }
 
             context_chunks = retrieval_results[:MAX_CONTEXT_CHUNKS]
+            if supplemental_chunks:
+                available_slots = max(0, MAX_CONTEXT_CHUNKS - len(context_chunks))
+                if available_slots > 0:
+                    context_chunks = context_chunks + supplemental_chunks[:available_slots]
             prompt_query = self._augment_query_for_prompt(query, sub_questions)
+            if intent == "book":
+                prompt_query = self._augment_book_prompt_with_thread(
+                    prompt_query=prompt_query,
+                    thread_messages=thread_messages,
+                )
 
             prompt = self.prompt_builder.build(
                 query=prompt_query,
                 context_chunks=context_chunks,
                 intent=intent,
+                conversation_window=conversation_window,
             )
 
-            llm_response = self._call_llm(prompt)
+            citations = []
+            if intent == "book":
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    citations_future = executor.submit(
+                        self.citation_manager.build,
+                        context_chunks,
+                    )
+                    llm_response = self._call_llm(prompt)
+                    citations = citations_future.result() or []
+            else:
+                llm_response = self._call_llm(prompt)
+
             if not llm_response:
                 return {
                     "response": "dont have an answer",
@@ -189,7 +230,8 @@ class AnsweringAgent:
                     "follow_up": self._build_follow_up(query, intent, coverage),
                 }
 
-            citations = self.citation_manager.build(context_chunks)
+            if intent != "book":
+                citations = self.citation_manager.build(context_chunks)
             if not citations:
                 return {
                     "response": "dont have an answer",
@@ -207,21 +249,65 @@ class AnsweringAgent:
                 "follow_up": self._build_follow_up(query, "general", []),
             }
 
+    def _build_supplemental_chunks(self, supplemental_context: str) -> List[Dict]:
+        text = (supplemental_context or "").strip()
+        if not text:
+            return []
+
+        sections = [part.strip() for part in re.split(r"(?=### Uploaded File:)", text) if part.strip()]
+        chunks: List[Dict] = []
+
+        for idx, section in enumerate(sections, start=1):
+            header = ""
+            body = section
+            if section.startswith("### Uploaded File:"):
+                lines = section.splitlines()
+                if lines:
+                    header = lines[0].replace("### Uploaded File:", "").strip()
+                    body = "\n".join(lines[1:]).strip()
+
+            cleaned_text = body.strip()
+            if not cleaned_text:
+                continue
+
+            upload_name = header or f"upload-{idx}"
+            chunks.append(
+                {
+                    "doc_id": f"uploaded_chat::{upload_name}",
+                    "chunk_id": f"upload_chunk_{idx}",
+                    "text": cleaned_text,
+                    "source": "uploaded_document",
+                    "metadata": {
+                        "chapter": "Uploaded chat document",
+                        "subheading": upload_name,
+                        "page_label": "upload",
+                        "page_physical": idx,
+                    },
+                    "rerank_score": 1.0,
+                }
+            )
+
+        return chunks
+
     def _retrieve_compound(
         self,
         queries: List[str],
         intent: str,
         retrieval_filters: Optional[Dict] = None,
+        retrieval_options: Optional[Dict] = None,
     ) -> Tuple[List[Dict], List[Dict]]:
         merged: List[Dict] = []
         coverage: List[Dict] = []
+        retrieval_mode = str((retrieval_options or {}).get("mode", "hybrid") or "hybrid").lower()
+        top_k = int((retrieval_options or {}).get("top_k", 8) or 8)
+        initial_k = int((retrieval_options or {}).get("initial_k", 25) or 25)
 
         for q in queries:
             results = self.retriever.retrieve(
                 query=q,
-                mode="hybrid",
-                top_k=8,
-                initial_k=25,
+                mode=retrieval_mode,
+                top_k=top_k,
+                initial_k=initial_k,
                 filters=retrieval_filters,
             )
             merged.extend(results)
@@ -297,6 +383,85 @@ class AnsweringAgent:
             return query
         bullet_points = "\n".join([f"- {item}" for item in sub_questions])
         return f"{query}\n\nSub-questions to address:\n{bullet_points}"
+
+    def _build_thread_aware_book_query(
+        self,
+        query: str,
+        thread_messages: Optional[List[Dict]] = None,
+    ) -> str:
+        current = (query or "").strip()
+        if not current:
+            return ""
+
+        user_history = [
+            (m.get("content") or "").strip()
+            for m in (thread_messages or [])
+            if (m.get("role") or "").strip().lower() == "user" and (m.get("content") or "").strip()
+        ]
+        if len(user_history) < 2:
+            return current
+
+        previous_user_query = user_history[-2]
+        if not previous_user_query:
+            return current
+
+        context_dependent = self._is_context_dependent_query(current)
+        short_follow_up = len(current.split()) <= 8
+        if not context_dependent and not short_follow_up:
+            return current
+
+        return f"{current}\n\nPrevious user context: {previous_user_query}"
+
+    def _augment_book_prompt_with_thread(
+        self,
+        prompt_query: str,
+        thread_messages: Optional[List[Dict]] = None,
+    ) -> str:
+        recent_pairs = []
+        pending_user = ""
+        for message in thread_messages or []:
+            role = (message.get("role") or "").strip().lower()
+            content = (message.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                pending_user = content
+                continue
+            if role == "assistant" and pending_user:
+                recent_pairs.append((pending_user, content))
+                pending_user = ""
+
+        if not recent_pairs:
+            return prompt_query
+
+        tail = recent_pairs[-2:]
+        context_lines = ["Conversation context:"]
+        for idx, (q, a) in enumerate(tail, start=1):
+            context_lines.append(f"- Turn {idx} user: {q}")
+            context_lines.append(f"- Turn {idx} assistant: {a}")
+
+        return f"{prompt_query}\n\n" + "\n".join(context_lines)
+
+    def _is_context_dependent_query(self, query: str) -> bool:
+        text = (query or "").strip().lower()
+        if not text:
+            return False
+
+        markers = [
+            "this",
+            "that",
+            "it",
+            "above",
+            "previous",
+            "same",
+            "continue",
+            "more",
+            "elaborate",
+            "explain more",
+            "summarize",
+            "format",
+        ]
+        return any(marker in text for marker in markers)
 
     def _call_llm(
         self,

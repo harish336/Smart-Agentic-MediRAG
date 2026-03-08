@@ -1,1 +1,47 @@
-[]
+[
+  {
+    "title": "FOREWORD",
+    "page_label": null,
+    "level": "chapter"
+  },
+  {
+    "title": "PREFACE TO THE 1992 EDITION",
+    "page_label": null,
+    "level": "chapter"
+  },
+  {
+    "title": "I",
+    "page_label": null,
+    "level": "chapter"
+  },
+  {
+    "title": "EXPERIENCES IN A CONCENTRATION CAMP",
+    "page_label": null,
+    "level": "section"
+  },
+  {
+    "title": "II",
+    "page_label": null,
+    "level": "chapter"
+  },
+  {
+    "title": "LOGOTHERAPY IN A NUTSHELL",
+    "page_label": null,
+    "level": "section"
+  },
+  {
+    "title": "POSTSCRIPT 1984",
+    "page_label": null,
+    "level": "chapter"
+  },
+  {
+    "title": "THE CASE FOR A TRAGIC OPTIMISM",
+    "page_label": null,
+    "level": "chapter"
+  },
+  {
+    "title": "AFTERWORD",
+    "page_label": "WILLIAM J. WINSLADE",
+    "level": "chapter"
+  }
+]

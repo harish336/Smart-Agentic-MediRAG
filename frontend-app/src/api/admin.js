@@ -20,7 +20,58 @@ export const adminIngestFiles = async (files, { onUploadProgress } = {}) => {
     });
     return response.data;
   } catch (error) {
-    throw error.response?.data || { error: "Ingestion failed" };
+    const payload = error.response?.data || { error: "Ingestion failed" };
+    const status = error.response?.status;
+    throw {
+      ...(typeof payload === "object" && payload !== null ? payload : { error: String(payload) }),
+      ...(status ? { status } : {}),
+    };
+  }
+};
+
+export const startAdminIngestionJob = async (files, { onUploadProgress } = {}) => {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error("Select at least one PDF file");
+  }
+
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
+
+  try {
+    const response = await api.post("/admin/ingest/upload?async=true", formData, {
+      headers: {
+        "Content-Type": "multipart/form-data",
+      },
+      timeout: 10 * 60 * 1000,
+      onUploadProgress,
+    });
+    return response.data;
+  } catch (error) {
+    const payload = error.response?.data || { error: "Ingestion failed" };
+    const status = error.response?.status;
+    throw {
+      ...(typeof payload === "object" && payload !== null ? payload : { error: String(payload) }),
+      ...(status ? { status } : {}),
+    };
+  }
+};
+
+export const getAdminIngestionJob = async (jobId) => {
+  try {
+    if (!jobId || !String(jobId).trim()) {
+      throw new Error("Job ID is required");
+    }
+    const response = await api.get(`/admin/ingest/jobs/${encodeURIComponent(String(jobId).trim())}`);
+    return response.data || {};
+  } catch (error) {
+    const payload = error.response?.data || { error: "Could not fetch ingestion status" };
+    const status = error.response?.status;
+    throw {
+      ...(typeof payload === "object" && payload !== null ? payload : { error: String(payload) }),
+      ...(status ? { status } : {}),
+    };
   }
 };
 

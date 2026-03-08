@@ -145,7 +145,7 @@ def _init_queue_listener() -> Queue:
     # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+        "[%(asctime)s] [%(levelname)s] [%(name)s] [%(threadName)s] %(message)s"
     ))
     handlers.append(console_handler)
     
@@ -173,7 +173,7 @@ def get_logger(
     logger.propagate = False
 
     formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+        "[%(asctime)s] [%(levelname)s] [%(name)s] [%(threadName)s] %(message)s"
     )
 
     # Console handler

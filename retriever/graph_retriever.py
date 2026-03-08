@@ -379,7 +379,8 @@ class GraphRetriever(BaseRetriever):
     def expand_chunk_context(
         self,
         chunk_id: str,
-        doc_id: Optional[str] = None
+        doc_id: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
     ) -> List[Dict]:
 
         try:
@@ -403,7 +404,8 @@ class GraphRetriever(BaseRetriever):
 
             expanded = self._expand_multihop(
                 [{"chunk_id": chunk_id}],
-                doc_id
+                doc_id,
+                owner_user_id,
             )
             
             # Deduplicate expanded results to prevent duplicates

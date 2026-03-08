@@ -87,6 +87,7 @@ class RetrieverOrchestrator:
 
             candidates = self._deduplicate(candidates)
             candidates = self._ensure_structure(candidates)
+            candidates = self._apply_doc_scope(candidates, filters)
             candidates = self._boost_lexical_alignment(query, candidates)
             candidates = self._boost_chunk_structure(query, candidates)
 
@@ -118,16 +119,37 @@ class RetrieverOrchestrator:
         filters: Optional[Dict],
     ) -> List[Dict]:
         queries = self._expand_query_variants(query)
+        if not queries:
+            return []
+
         results: List[Dict] = []
-        for q in queries:
-            if retriever == "vector":
-                results.extend(
-                    self.vector_retriever.retrieve(q, top_k=initial_k, filters=filters)
-                )
-            else:
-                results.extend(
-                    self.graph_retriever.retrieve(q, top_k=initial_k, filters=filters)
-                )
+
+        max_workers = min(4, len(queries))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for q in queries:
+                if retriever == "vector":
+                    futures.append(
+                        executor.submit(
+                            self.vector_retriever.retrieve,
+                            q,
+                            initial_k,
+                            filters,
+                        )
+                    )
+                else:
+                    futures.append(
+                        executor.submit(
+                            self.graph_retriever.retrieve,
+                            q,
+                            initial_k,
+                            filters,
+                        )
+                    )
+
+            for fut in as_completed(futures):
+                results.extend(fut.result() or [])
+
         return self._deduplicate(results)
 
     def _hybrid_retrieve(
@@ -173,12 +195,16 @@ class RetrieverOrchestrator:
             graph_expanded: List[Dict] = []
 
             if expansion_seed:
+                owner_user_id = None
+                if filters and filters.get("owner_user_id"):
+                    owner_user_id = str(filters.get("owner_user_id")).strip() or None
                 with ThreadPoolExecutor(max_workers=min(4, len(expansion_seed))) as executor:
                     expand_jobs = [
                         executor.submit(
                             self.graph_retriever.expand_chunk_context,
                             seed["chunk_id"],
                             seed.get("doc_id"),
+                            owner_user_id,
                         )
                         for seed in expansion_seed
                         if seed.get("chunk_id")
@@ -220,6 +246,22 @@ class RetrieverOrchestrator:
             item["score"] = base * source_weights.get(source, 1.0)
             boosted.append(item)
         return boosted
+
+    def _apply_doc_scope(self, results: List[Dict], filters: Optional[Dict]) -> List[Dict]:
+        if not results or not filters:
+            return results
+
+        raw_doc_ids = filters.get("doc_ids")
+        if not isinstance(raw_doc_ids, list):
+            return results
+
+        allowed = {str(doc_id).strip() for doc_id in raw_doc_ids if str(doc_id).strip()}
+        if not allowed:
+            return results
+
+        scoped = [item for item in results if str(item.get("doc_id") or "").strip() in allowed]
+        logger.info("Doc scope filter applied | before=%d after=%d", len(results), len(scoped))
+        return scoped
 
     def _boost_lexical_alignment(self, query: str, results: List[Dict]) -> List[Dict]:
         query_terms = set(re.findall(r"[a-zA-Z0-9]+", query.lower()))

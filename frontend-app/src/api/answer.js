@@ -7,7 +7,10 @@ import api from "./axios";
 export const askQuestion = async ({
   query,
   thread_id = null,
+  query_mode = "fast",
   upload_ids = [],
+  user_message_meta = null,
+  thread_messages = [],
   rewrite_from_message_id = "",
   agent_hint = "",
   signal,
@@ -22,7 +25,10 @@ export const askQuestion = async ({
       {
         query,
         thread_id,
+        query_mode,
         upload_ids,
+        user_message_meta,
+        thread_messages,
         rewrite_from_message_id: rewrite_from_message_id || "",
         agent_hint: agent_hint || "",
       },
@@ -130,6 +136,23 @@ export const deleteChatUpload = async (uploadId) => {
     return response.data;
   } catch (error) {
     throw error.response?.data || { error: "Could not cancel upload" };
+  }
+};
+
+export const fetchChatUploadBlob = async (uploadId) => {
+  try {
+    if (!uploadId || !String(uploadId).trim()) {
+      throw new Error("uploadId is required");
+    }
+    const response = await api.get(`/chat/uploads/${encodeURIComponent(uploadId)}/file`, {
+      responseType: "blob",
+    });
+    return response.data;
+  } catch (error) {
+    if (error.response?.data) {
+      throw error.response.data;
+    }
+    throw { error: "Network error", message: "Unable to load uploaded file" };
   }
 };
 

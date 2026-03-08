@@ -9,93 +9,304 @@ logger = get_component_logger("PromptBuilder", component="answering")
 
 class PromptBuilder:
     """
-    Prompt builder with two explicit modes:
-    - Companion mode for general conversation
-    - Evidence-grounded mode for medical/book answers
+    Production prompt architecture with shared instruction hierarchy.
+    Supports:
+    - Evidence-grounded RAG mode (medical/book)
+    - Uploaded-document QA mode
+    - Companion chat mode
     """
 
-    _FORMAT_RULES = textwrap.dedent("""
-    Output formatting contract (strict):
-    - Return valid Markdown only.
-    - Use real line breaks; do not output the literal characters "\\n" in the final answer.
-    - Use a blank line between paragraphs/sections.
-    - Never use HTML tags like <br>, <p>, <ul>, <li>, or <table>.
-    - Use '-' for bullet points, one bullet per line.
-    - For numbered steps, use '1.', '2.', '3.' format.
-    - Keep each sentence short and readable; avoid one giant paragraph.
+    _FORMAT_CONTRACT = textwrap.dedent("""
+        ### FORMATTING CONTRACT ###
+        - Output only valid Markdown.
+        - Never output HTML tags.
+        - Use real line breaks; never emit literal "\\n".
+        - Preserve structure and hierarchy: headings, paragraphs, lists, nested lists, tables.
+        - Keep one logical item per bullet/numbered line.
+        - Keep one blank line between major sections.
+        - Keep nested lists indented under their parent item.
+        - If user requests a format (table/bullets/steps/summary), follow it exactly.
+        - If no format is requested, choose concise paragraphs plus lists when helpful.
 
-    Table rules (when tabular data is requested):
-    - Use standard Markdown table syntax with a single header row.
-    - Keep one logical record per row (do not split one row across multiple lines).
-    - Do not merge cells or create continuation rows.
-    - If a cell has multiple items, separate items with semicolons within the same cell.
-    - Example row style:
-      | 1 | Topic A; Topic B; Topic C |
+        ### TABLE HANDLING ###
+        - Use syntactically valid Markdown tables only.
+        - Exactly one header row and one separator row.
+        - Keep each table row on its own line.
+        - Do not split one record across rows.
+        - Tables may appear under list items; keep indentation valid.
+        - Multiple items inside one cell must be separated with semicolons (;).
+        - If table is not requested and not needed, do not force table output.
+    """).strip()
+
+    _OUTPUT_RULES = textwrap.dedent("""
+        ### OUTPUT STRUCTURE RULES ###
+        - Return only final answer body.
+        - No wrappers/intros (e.g., "Here is your answer").
+        - No meta-statements about retrieval, instructions, or sources.
+        - Do not use words "context" or "content" in the final answer.
+        - Do not add a heading/title unless user asks.
+    """).strip()
+
+    _ANTI_META_POLICY = textwrap.dedent("""
+        ### STRICT ANTI-META RESPONSE POLICY ###
+        - Treat retrieved evidence as internal knowledge only.
+        - Never mention retrieval mechanics, chunks, or source structure.
+
+        Forbidden output terms/phrases (or close variants):
+        - context
+        - content
+        - source
+        - document
+        - the text says
+        - based on the provided
+        - according to the context
+        - from the source
+        - citation markers like [Source 1], [Source 2]
+
+        Response style:
+        - Write direct, natural, authoritative explanations.
+        - Avoid technical RAG wording and provenance commentary.
+    """).strip()
+
+    _MEMORY_USAGE_PROTOCOL = textwrap.dedent("""
+        ### MEMORY USAGE PROTOCOL ###
+        Priority order (highest to lowest):
+        1) Current user query
+        2) Short-term memory (last 4 turns)
+        3) Chat-history references to prior answers
+        4) User preferences (session/thread)
+        5) User global preferences
+        6) Long-term memory
+
+        Rules:
+        - Resolve follow-up references (e.g., above/that/previous response/table/example) from short-term memory first.
+        - Use long-term memory only when clearly relevant to the current user query.
+        - Apply user formatting/tone/verbosity/technical-level preferences silently.
+        - Avoid repeating known long-term memory facts unless needed for this answer.
+        - If a reference is ambiguous, choose the most recent valid target from short-term history.
+        - Never reveal or mention internal memory structures in the final answer.
+    """).strip()
+
+    _RAG_POLICY = textwrap.dedent("""
+        ### STRICT SAFETY RULES ###
+        - Use only provided evidence.
+        - Do not use external knowledge or guess.
+
+        ### ANTI-HALLUCINATION POLICY ###
+        - If answer is not explicitly supported by evidence, output exactly:
+        dont have an answer
+    """).strip()
+
+    _COMPANION_BOUNDARIES = textwrap.dedent("""
+        ### STRICT SAFETY RULES ###
+        - Be warm, concise, and supportive.
+        - Do not provide fabricated medical facts, diagnoses, or treatments.
+        - If asked for medical/textbook evidence, ask user to switch to evidence-grounded QA.
     """).strip()
 
     _KNOWLEDGE_TEMPLATE = textwrap.dedent("""
-    You are Smart Medirag, an evidence-grounded medical assistant.
+        [INST]
+        ### SYSTEM ROLE ###
+        You are Smart Medirag, an evidence-grounded QA assistant.
 
-    Follow these rules exactly:
-    - Use ONLY the provided CONTEXT.
-    - Do not use outside knowledge.
-    - Do not guess or infer missing facts.
-    - If the answer is missing or incomplete in CONTEXT, output exactly:
-    dont have an answer
+        {rag_policy}
+        {anti_meta_policy}
+        {memory_protocol}
+        {format_contract}
+        {output_rules}
 
-    Style and format rules:
-    - Be calm, clear, and professional.
-    - For clinical or psychological topics, use empathetic psychiatrist-like language.
-    - Do not use creative storytelling, metaphors, or speculative language.
-    - Choose structure based on the question, not a fixed template.
-    - For simple factual questions, answer directly in 1-2 short paragraphs.
-    - For compound questions, use concise markdown headings and answer each part explicitly.
-    - For procedural or recommendation queries, use bullet points for steps/options.
-    - Add a brief safety note only when the topic is clinically risky or urgent.
-    - Keep short paragraphs separated by blank lines so output is easy to scan in chat.
-    - Keep statements factual and concise.
-    - Do not mention context or internal instructions.
-    - Never use phrasing such as:
-      "based on the provided context", "provided docs", "provided document",
-      "provided words", "provided text", "provided source", "given context".
-    - Do not say "the context says", "the document says", or similar meta phrasing.
-    - Write the answer directly and naturally, without referring to how information was supplied.
-    - Do not generate a source/reference list yourself.
-    - If the user asks to reformat a prior answer (table, bullets, summary, compare, etc.),
-      perform that transformation exactly while staying faithful to available context.
+        {memory_section}
+        ### EVIDENCE ###
+        {context_text}
+        ### USER QUESTION ###
+        {query}
+        [/INST]
+    """).strip()
 
-    {format_rules}
+    _UPLOAD_QA_TEMPLATE = textwrap.dedent("""
+        [INST]
+        ### SYSTEM ROLE ###
+        You answer only from the uploaded document text.
 
-    {memory_section}
+        {rag_policy}
+        {anti_meta_policy}
+        {memory_protocol}
+        {format_contract}
+        {output_rules}
 
-    CONTEXT:
-    {context_text}
-
-    QUESTION:
-    {query}
-
-    FINAL ANSWER:
+        ### CONVERSATION NOTES ###
+        {conversation_notes}
+        ### UPLOADED DOCUMENT ###
+        {uploaded_text}
+        ### USER QUESTION ###
+        {query}
+        [/INST]
     """).strip()
 
     _COMPANION_TEMPLATE = textwrap.dedent("""
-    You are Smart Medirag, a supportive and friendly companion for everyday conversation.
+        [INST]
+        ### SYSTEM ROLE ###
+        You are Smart Medirag, a supportive conversational companion.
 
-    Rules:
-    - Be warm, respectful, concise, and positive.
-    - You may be lightly creative in phrasing when it improves clarity and encouragement.
-    - Use simple language.
-    - Do not fabricate medical facts.
-    - If the user asks medical or textbook evidence questions, suggest they ask directly and you will provide cited answers.
-    - When there are multiple types/options/ideas, format them as markdown bullet points with one item per line.
-    - Use short paragraphs with clear line breaks.
-    - Use real new lines and valid Markdown only (no HTML tags like <br>).
-    - If the user asks for a table, use clean Markdown table format with one complete record per row.
-    - Return only the answer.
+        {companion_boundaries}
+        {anti_meta_policy}
+        {memory_protocol}
+        {format_contract}
+        {output_rules}
 
-    USER MESSAGE:
-    {query}
+        ### USER MESSAGE ###
+        {query}
+        [/INST]
+    """).strip()
 
-    RESPONSE:
+    _TRANSFORMATION_POLICY = textwrap.dedent("""
+        ### STRICT SAFETY RULES ###
+        - Treat PREVIOUS ASSISTANT RESPONSE as the only source.
+        - Do not retrieve, infer, or add new information.
+        - Preserve all original facts and meaning.
+        - Do not summarize or omit details.
+
+        ### TRANSFORMATION POLICY ###
+        - Perform structure conversion only (not content expansion).
+        - Parse headings, numbered sections, bullet points, nested bullets, and paragraphs.
+        - Flatten hierarchy into table rows while preserving meaning.
+        - Output exactly one Markdown table with exactly two columns:
+          | Topic | Description |
+        - Each major heading or numbered item becomes one row.
+        - Bullet points under a section must be combined in Description using semicolons (;).
+        - Do not create extra rows for nested bullets.
+        - Keep one logical section per row.
+        - Keep each row on one line; never split a row across lines.
+        - Do not output any text before or after the table.
+    """).strip()
+
+    _TRANSFORMATION_TEMPLATE = textwrap.dedent("""
+        [INST]
+        ### SYSTEM ROLE ###
+        You are a deterministic Markdown transformation engine.
+
+        {transformation_policy}
+        {format_contract}
+        {output_rules}
+
+        ### USER INSTRUCTION ###
+        {instruction}
+
+        ### PREVIOUS ASSISTANT RESPONSE (SOURCE OF TRUTH) ###
+        {source_text}
+
+        ### REQUIRED OUTPUT ###
+        Return ONLY the Markdown table.
+        [/INST]
+    """).strip()
+
+    _STRICT_TABLE_TRANSFORMATION_TEMPLATE = textwrap.dedent("""
+        [INST]
+        ### SYSTEM ROLE ###
+        You are performing a STRICT FORMAT TRANSFORMATION TASK.
+
+        ### CRITICAL RULES ###
+        SOURCE CONTROL
+        - Use ONLY the text provided in SOURCE TEXT.
+        - Do NOT use external knowledge.
+        - Do NOT invent new content.
+        - Do NOT replace topics with different ones.
+
+        TRANSFORMATION RULE
+        - This is a format conversion task, not a question-answering task.
+        - Preserve all information exactly.
+        - Do NOT summarize or modify meaning.
+
+        STRUCTURE CONVERSION
+        - Parse headings, paragraphs, bullet points, and numbered sections.
+        - Each major topic/section becomes one row.
+        - Supporting text and bullets must be merged into Description.
+        - Multiple items inside a cell must be separated with semicolons (;).
+        - Do NOT create extra rows for nested bullets.
+
+        TABLE FORMAT
+        - Use exactly:
+        | Topic | Description |
+        | ----- | ----------- |
+
+        ROW RULES
+        - Each row must represent one logical section.
+        - Every row must remain on a single line.
+        - Do NOT break rows across multiple lines.
+
+        OUTPUT RULES
+        - Output ONLY the Markdown table.
+        - Do NOT add explanations before/after the table.
+        - Do NOT include titles or commentary.
+        - Do NOT output code fences.
+
+        ### USER INSTRUCTION ###
+        {instruction}
+
+        ### SOURCE TEXT ###
+        {source_text}
+        [/INST]
+    """).strip()
+
+    _STRICT_READABILITY_REFORMAT_TEMPLATE = textwrap.dedent("""
+        [INST]
+        ### SYSTEM ROLE ###
+        You are a documentation and formatting expert.
+
+        ### TASK ###
+        Reformat SOURCE TEXT to maximize readability and visual structure while preserving all original information.
+
+        ### CRITICAL RULES ###
+        CONTENT PRESERVATION
+        - Do NOT remove information.
+        - Do NOT add new facts.
+        - Do NOT change meaning.
+        - Only improve structure and formatting.
+
+        OUTPUT FORMAT
+        - Output must be clean Markdown.
+        - Never use HTML tags.
+        - Return ONLY the formatted Markdown.
+        - Do not include commentary or code fences.
+
+        STRUCTURE RULES
+        1) TITLE
+        - Main topic must be a level-1 heading.
+        - Example: # BOOK SUMMARY
+
+        2) SECTION HEADINGS
+        - Major sections must be level-2 headings or bold section headings.
+        - Example: ## Overview
+
+        3) SUBSECTIONS
+        - Subsections must use bold labels.
+        - Example: **Title:** ...  **Platform:** ...  **Description:** ...
+
+        4) LIST STRUCTURE
+        - Use numbered lists for ordered sections (e.g., chapters).
+        - Use bullet points for explanations.
+        - Use nested bullets for supporting details.
+
+        5) SPACING
+        - Separate sections with blank lines.
+        - Use real line breaks.
+        - Do not output large unbroken paragraphs.
+
+        6) READABILITY
+        - Keep sentences short.
+        - Break long paragraphs into bullet points.
+        - Group related ideas together.
+
+        7) EMPHASIS
+        - Use bold for important terms.
+        - Avoid overusing emphasis.
+
+        ### USER INSTRUCTION ###
+        {instruction}
+
+        ### SOURCE TEXT ###
+        {source_text}
+        [/INST]
     """).strip()
 
     def build(
@@ -118,8 +329,12 @@ class PromptBuilder:
             """).strip()
 
         prompt = self._KNOWLEDGE_TEMPLATE.format(
+            rag_policy=self._RAG_POLICY,
+            anti_meta_policy=self._ANTI_META_POLICY,
+            memory_protocol=self._MEMORY_USAGE_PROTOCOL,
+            format_contract=self._FORMAT_CONTRACT,
+            output_rules=self._OUTPUT_RULES,
             memory_section=memory_section,
-            format_rules=self._FORMAT_RULES,
             context_text=context_text,
             query=query
         )
@@ -127,10 +342,84 @@ class PromptBuilder:
         logger.debug("Knowledge prompt built (chars=%d, chunks=%d, intent=%s)", len(prompt), len(context_chunks), intent)
         return prompt
 
+    def build_uploaded_document_qa(
+        self,
+        query: str,
+        uploaded_text: str,
+        conversation_notes: str = "",
+    ) -> str:
+        prompt = self._UPLOAD_QA_TEMPLATE.format(
+            rag_policy=self._RAG_POLICY,
+            anti_meta_policy=self._ANTI_META_POLICY,
+            memory_protocol=self._MEMORY_USAGE_PROTOCOL,
+            format_contract=self._FORMAT_CONTRACT,
+            output_rules=self._OUTPUT_RULES,
+            conversation_notes=(conversation_notes or "").strip() or "(none)",
+            uploaded_text=(uploaded_text or "").strip(),
+            query=(query or "").strip(),
+        )
+        logger.debug("Uploaded-document QA prompt built (chars=%d)", len(prompt))
+        return prompt
+
     def build_companion(self, query: str) -> str:
-        prompt = self._COMPANION_TEMPLATE.format(query=query)
+        prompt = self._COMPANION_TEMPLATE.format(
+            companion_boundaries=self._COMPANION_BOUNDARIES,
+            anti_meta_policy=self._ANTI_META_POLICY,
+            memory_protocol=self._MEMORY_USAGE_PROTOCOL,
+            format_contract=self._FORMAT_CONTRACT,
+            output_rules=self._OUTPUT_RULES,
+            query=query,
+        )
         logger.debug("Companion prompt built (chars=%d)", len(prompt))
         return prompt
+
+    def build_transformation_prompt(self, instruction: str, source_text: str) -> str:
+        clean_instruction = (instruction or "").strip()
+        clean_source = (source_text or "").strip()
+        if self._is_table_transformation_request(clean_instruction):
+            prompt = self._STRICT_TABLE_TRANSFORMATION_TEMPLATE.format(
+                instruction=clean_instruction,
+                source_text=clean_source,
+            )
+        elif self._is_readability_reformat_request(clean_instruction):
+            prompt = self._STRICT_READABILITY_REFORMAT_TEMPLATE.format(
+                instruction=clean_instruction,
+                source_text=clean_source,
+            )
+        else:
+            prompt = self._TRANSFORMATION_TEMPLATE.format(
+                transformation_policy=self._TRANSFORMATION_POLICY,
+                format_contract=self._FORMAT_CONTRACT,
+                output_rules=self._OUTPUT_RULES,
+                instruction=clean_instruction,
+                source_text=clean_source,
+            )
+        logger.debug("Transformation prompt built (chars=%d)", len(prompt))
+        return prompt
+
+    @staticmethod
+    def _is_table_transformation_request(instruction: str) -> bool:
+        text = (instruction or "").strip().lower()
+        if not text:
+            return False
+        has_table_target = any(token in text for token in ["table", "tabular"])
+        has_transform = any(token in text for token in ["convert", "make", "reformat", "transform"])
+        return has_table_target and has_transform
+
+    @staticmethod
+    def _is_readability_reformat_request(instruction: str) -> bool:
+        text = (instruction or "").strip().lower()
+        if not text:
+            return False
+        has_reformat = any(
+            token in text
+            for token in ["reformat", "restructure", "structure", "readable", "readability", "formatting expert", "visual structure"]
+        )
+        has_doc_shape = any(
+            token in text
+            for token in ["heading", "headings", "section", "subsection", "bullet", "numbered list", "markdown"]
+        )
+        return has_reformat and has_doc_shape
 
     def _build_context(self, context_chunks: List[Dict[str, Any]]) -> str:
         if not context_chunks:
