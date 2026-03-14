@@ -11,7 +11,8 @@ toc_detection:
       - "contents"
       - "index"
       - "chapter"
-    min_confidence: 0.6
+      - "section"
+    min_confidence: 0.65
 
   vision_llm:
     enabled: true
@@ -20,17 +21,19 @@ toc_detection:
     expected_output: "YES|NO"
 
     provider: local       # local | api
-    model: "llava-1.5-7b" # local free vision model
+    model: "qwen2-vl:7b"  # improved vision model for document understanding
     max_tokens: 10
     temperature: 0.0
+
 
 # ---------- OCR ----------
 ocr:
   enabled: true
-  engine: tesseract
+  engine: paddleocr      # more accurate than tesseract
   language: eng
   dpi: 300
-  confidence_threshold: 0.5
+  confidence_threshold: 0.55
+
 
 # ---------- Offset Identification ----------
 offset_detection:
@@ -42,6 +45,7 @@ offset_detection:
 
   negative_offset_handling:
     clamp_to_zero: true
+
 
 # ---------- Style Identification ----------
 style_detection:
@@ -59,12 +63,13 @@ style_detection:
     remove: true
     frequency_threshold: 0.8
 
+
 # ---------- Chunk Accumulation ----------
 chunking:
   enabled: true
   strategy: "hierarchical"
 
-  max_chars: 1500
+  max_chars: 800
   split_on: "sentence"
 
   accumulation_rules:
@@ -75,42 +80,47 @@ chunking:
   ordering:
     sort_by: "page_physical"
 
+
 # ---------- Overlap ----------
 overlap:
   enabled: true
-  pre_overlap: 300
-  post_overlap: 300
+  pre_overlap: 120
+  post_overlap: 120
+
 
 # ---------- Embeddings ----------
 embedding:
   enabled: true
   provider: sentence-transformers
-  model: all-MiniLM-L6-v2   # fast + free + accurate
+  model: BAAI/bge-base-en-v1.5   # much stronger than MiniLM
   device: cpu
   normalize: true
+
 
 # ---------- Retriever ----------
 retriever:
   default: hybrid
 
   semantic:
-    top_k: 10
+    top_k: 12
 
   graph:
     enabled: true
     traversal_depth: 2
 
   reranker:
-    enabled: false          # can enable later
-    model: cross-encoder/ms-marco-MiniLM-L-6-v2
+    enabled: true
+    model: BAAI/bge-reranker-base
+    top_k: 6
+
 
 # ---------- Answering ----------
 answering:
   llm:
     provider: local
-    model: mistral-7b-instruct
-    temperature: 0.2
-    max_tokens: 512
+    model: qwen2.5:7b
+    temperature: 0.1
+    max_tokens: 600
 
   citation:
     enabled: true
@@ -119,20 +129,23 @@ answering:
   safety:
     refuse_if_no_context: true
 
+
 # ---------- Performance ----------
 performance:
   batch_size: 8
   enable_caching: true
   cache_ttl: 3600
 
+
 # ---------- Logging ----------
 logging:
   level: INFO
   log_model_calls: false
 
+
 # ---------- Emotion Analysis ----------
 emotion:
   provider: local
-  model: phi
+  model: phi3:mini
   temperature: 0.0
   max_tokens: 50
